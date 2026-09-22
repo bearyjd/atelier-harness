@@ -1,0 +1,13 @@
+# Example per-project egress allow-list addition (README.md "Overlay
+# convention"). Concatenated with the base list and every other project's
+# allowlist.d file by `just build-egress` -- the union applies to the one
+# shared atelier-egress proxy, not just containers built from this
+# overlay (AUDIT.md §4.2). One hostname per line, validated against
+# ^[A-Za-z0-9.-]+$ by entrypoint.sh at container start: no wildcards, no
+# scheme, no path.
+#
+# registry.npmjs.org: a real project overlay that installs npm packages
+# at container-run time (as opposed to at build time, which needs no
+# egress at all) would need this to let `npm install` reach the registry
+# through the proxy.
+registry.npmjs.org

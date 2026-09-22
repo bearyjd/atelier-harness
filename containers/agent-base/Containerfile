@@ -1,0 +1,210 @@
+# agent-base: shared foundation image for Atelier agent containers.
+#
+# Provides the coding-agent CLIs (claude, codex, pi, pi-flow), git, gh, and
+# a non-root user. No project toolchains here -- those belong in
+# per-project overlay images (containers/<project>/Containerfile) that
+# `FROM agent-base`. See AUDIT.md §6 for the inputs this file implements.
+#
+# Base image is pinned by digest (matches the host and the `dev`
+# distrobox; verified 2026-09-21 against registry.fedoraproject.org).
+FROM registry.fedoraproject.org/fedora@sha256:dee2b968c71a167b08a6e0027db0380fc2f037796aeed620556a4fcbc6a1ed7f
+
+# ARGs must come after FROM to stay in scope for the rest of the file --
+# an ARG declared before FROM is only visible to the FROM line itself.
+ARG CLAUDE_VERSION=2.1.278
+# Codex/pi/pi-flow versions are NOT ARGs here (they were, before
+# 2026-09-22) -- npm/package.json and npm/package-lock.json are now the
+# single source of truth for those three versions and their whole
+# dependency graph (see the npm RUN block below). An ARG here would be
+# vestigial: bumping it would change nothing, since npm ci reads from
+# the lockfile, not from a --build-arg. To bump codex/pi/pi-flow, edit
+# containers/agent-base/npm/package.json and regenerate package-lock.json.
+# sha256 of this Containerfile, computed by the Justfile at build time and
+# passed in with --build-arg. Powers the org.atelier.source-sha label that
+# agent-enter.sh (Phase 2) uses for staleness detection (AUDIT.md §3.1).
+ARG SOURCE_SHA=unknown
+# RFC3339 build timestamp, computed by the Justfile (not baked as a
+# literal so the image stays reproducible from source + args).
+ARG BUILD_CREATED=""
+# sha256 of the linux-x64 `claude` binary for CLAUDE_VERSION, taken from
+# https://downloads.claude.ai/claude-code-releases/2.1.278/manifest.json
+# and independently re-verified by downloading that exact URL and hashing
+# it (2026-09-22) -- not just copied from the manifest and trusted. See
+# the RUN block below for why this replaced the vendored install script.
+ARG CLAUDE_BINARY_SHA256=5c4735937844e84f8a93306e841a5b0e12252909b07870f789b190468da147ab
+
+# Fedora 44's nodejs is only available as a major-version-suffixed package
+# (nodejs24, nodejs22, ...) -- there is no bare "nodejs" package. npm is a
+# separate subpackage (nodejs24-npm) and is NOT pulled in automatically by
+# nodejs24 alone; both must be listed explicitly. Verified empirically
+# 2026-09-21: `dnf install nodejs24` alone leaves `npm` missing.
+#
+# --setopt=install_weak_deps=False keeps this to only what's needed: no
+# toolchain-specific packages (those live in per-project overlays).
+#
+# The registry.fedoraproject.org/fedora:44 base image ships `sudo`
+# pre-installed (it is NOT pulled in by anything above -- verified against
+# a bare base image). It is dnf-protected, so plain `dnf remove sudo` is
+# refused; --setopt=protected_packages= overrides that for this one
+# removal. CORRECTION (2026-09-22, security + critic review both caught
+# this): removing sudo here does NOT cascade out pam/authselect/
+# libpwquality/cracklib -- those stay installed because the preceding
+# `dnf install` of git-core/gh/nodejs24/etc. already pulled in openssh and
+# util-linux, which depend on pam independently of sudo. The cascade only
+# happens on a bare base image with nothing else installed. Only `sudo`
+# itself is removed; the setuid-root binaries that ship with the packages
+# that DO stay (passwd, su, mount, newgrp, gpasswd, chsh, chfn, chage,
+# unix_chkpwd, pam_timestamp_check, umount) are handled below by stripping
+# their setuid bit directly rather than by removing packages agent-base
+# still needs. `! command -v sudo` asserts the removal actually took at
+# build time rather than relying on a comment being true.
+#
+# Both the install and the sudo removal happen in this one layer so the
+# removed package's bytes don't linger in an intermediate layer; caches
+# are cleaned here too so nothing dnf-related bloats the image.
+RUN dnf install -y --setopt=install_weak_deps=False \
+      git-core \
+      gh \
+      nodejs24 \
+      nodejs24-npm \
+      ca-certificates \
+      curl \
+      tar \
+      gzip \
+      procps-ng \
+      less \
+      which \
+    && dnf remove -y --setopt=protected_packages= sudo \
+    && ! command -v sudo \
+    && find / -xdev -perm -4000 -type f 2>/dev/null -exec chmod u-s {} + \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum
+
+# Non-root user, uid/gid 1000. This specific uid is required (not just
+# "any non-root uid") because `podman run --userns=keep-id:uid=1000,gid=1000`
+# (AUDIT.md §4.3) maps the container's uid 1000 to the host owner's uid
+# 1000 one-to-one -- that's what lets the bind-mounted project directory be
+# read/writable by the agent user without chown games or a shared-label
+# (`:z`) mount. No sudo is installed anywhere in this image.
+RUN groupadd -g 1000 agent \
+    && useradd -u 1000 -g 1000 -m -s /bin/bash agent
+
+# PATH picks up per-user installs (claude, codex, pi all land symlinks
+# or binaries in ~/.local/bin) ahead of system paths.
+ENV PATH="/home/agent/.local/bin:${PATH}"
+
+# All Claude Code state (auth, settings, project index) is redirected into
+# this directory instead of the default ~/.claude.json-in-home-row layout,
+# so that a single named volume (atelier-auth-claude, AUDIT.md §4.1) is
+# both the credential store AND the full state store -- nothing leaks into
+# the container's writable layer, which is discarded on rebuild.
+#
+# NOTE: Podman only copies an image's content into a named volume when
+# that volume is EMPTY. Once `just auth` (or scripts/auth-import.sh)
+# populates atelier-auth-claude, whatever the image placed under this
+# path is permanently shadowed -- silently, with no warning from Podman.
+# This is intentional (the volume is the source of truth for credentials
+# and settings) but worth knowing before debugging a "my settings didn't
+# take" report.
+ENV CLAUDE_CONFIG_DIR="/home/agent/.claude"
+
+# Egress proxy hook point (AUDIT.md §4.2). Declared empty here; the actual
+# value (http://atelier-egress:3128) is injected at `podman run` time via
+# -e for the "proxied" network profile. Left unset entirely, most CLIs and
+# package managers fall back to direct connections, so an explicit empty
+# string is the deliberate default for the "none" profile.
+#
+# Both cases are set: curl deliberately ignores uppercase HTTP_PROXY (an
+# httpoxy-attack mitigation) and only honours lowercase http_proxy, while
+# most CLIs here (claude, codex, gh) honour the uppercase form. Setting
+# only one silently breaks the other family of tools under the "proxied"
+# profile -- verified empirically 2026-09-22.
+ENV HTTP_PROXY="" \
+    HTTPS_PROXY="" \
+    NO_PROXY="" \
+    http_proxy="" \
+    https_proxy="" \
+    no_proxy=""
+
+LABEL org.atelier.source-sha="${SOURCE_SHA}" \
+      org.opencontainers.image.source="https://github.com/bearyjd/atelier-harness" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
+      org.opencontainers.image.title="agent-base" \
+      org.opencontainers.image.description="Shared foundation image for Atelier agent containers: claude, codex, pi, pi-flow, git, gh on a non-root Fedora 44 base."
+
+# Everything below runs as the non-root agent user, so every downloaded
+# binary and every npm-installed file is already owned correctly (no
+# chown pass needed).
+USER agent
+WORKDIR /home/agent
+
+# Claude Code: direct, exact-version binary download -- NOT the vendored
+# installer script this used to run. CORRECTION (2026-09-22, Codex
+# adversarial review, HIGH): that script's own bootstrap step always
+# fetched whatever "latest" currently is from
+# https://downloads.claude.ai/claude-code-releases/latest -- a genuinely
+# mutable endpoint -- and trusted a checksum from that same mutable
+# service, before ever looking at CLAUDE_VERSION. Pinning the *script*
+# (what the prior fix round did) does not pin *what the script downloads
+# and runs*. This replaces that whole bootstrap-then-self-install
+# mechanism with a single fetch of the exact pinned version's binary,
+# verified against a checksum recorded in THIS file (not fetched at
+# build time from anywhere) and independently re-checked against the
+# downloaded artifact by hand before being pinned here.
+#
+# Platform is hardcoded to linux-x64 rather than auto-detected (as the
+# old installer did): this image only ever builds on the Fedora
+# glibc/x86_64 base pinned above, so detection logic for macOS/musl/arm64
+# would be dead code here.
+#
+# The installed layout replicates the minimal part of what the installer
+# used to set up, inspected from a prior build: the binary lives at
+# ~/.local/share/claude/versions/<version>, and ~/.local/bin/claude is a
+# symlink to it. No other files, config, or "self-install" step is
+# needed -- verified the downloaded binary runs standalone (`claude
+# --version`) with nothing else present.
+RUN curl -fsSL -o /tmp/claude-binary \
+      "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
+    && echo "${CLAUDE_BINARY_SHA256}  /tmp/claude-binary" | sha256sum -c - \
+    && mkdir -p /home/agent/.local/share/claude/versions /home/agent/.local/bin \
+    && install -m 0755 /tmp/claude-binary "/home/agent/.local/share/claude/versions/${CLAUDE_VERSION}" \
+    && rm -f /tmp/claude-binary \
+    && ln -s "/home/agent/.local/share/claude/versions/${CLAUDE_VERSION}" /home/agent/.local/bin/claude
+
+# Codex, pi, and pi-flow: a pinned, lockfile-verified npm install rather
+# than three unpinned `npm install -g <pkg>@<version>` calls.
+# CORRECTION (2026-09-22, Codex adversarial review, MEDIUM): pinning only
+# the top-level version still let every transitive dependency and its
+# integrity metadata resolve from the live registry at build time. The
+# package-lock.json below locks the full dependency graph; `npm ci`
+# refuses to run at all if it and package.json disagree.
+#
+# `npm ci` is a project-local operation (it manages ITS directory's own
+# node_modules from a lockfile) -- it has no `-g`/global mode, so this
+# installs into a dedicated project directory rather than a "global"
+# prefix. --ignore-scripts is unchanged from before: no third-party
+# postinstall code runs.
+COPY --chown=agent:agent npm/package.json npm/package-lock.json /home/agent/.local/lib/atelier-npm/
+RUN cd /home/agent/.local/lib/atelier-npm \
+    && npm ci --ignore-scripts
+
+# The three packages' executables are symlinked into ~/.local/bin
+# individually, from each package's OWN `bin` field, rather than via
+# `node_modules/.bin`. This is not cosmetic: `node_modules/.bin/pi`
+# resolved to `@earendil-works/pi-coding-agent`'s `pi` binary, not the
+# pinned `@mariozechner/pi-coding-agent`'s -- npm's hoisting picked
+# whichever of the two co-installed packages happened to win the name,
+# silently unpinning `pi` if that path had been used. Verified 2026-09-22.
+# `pi-flow` has no `bin` entry at all (confirmed via its package.json) --
+# it's a library `pi` loads via node's normal module resolution from the
+# same node_modules tree, not a command.
+RUN ln -s /home/agent/.local/lib/atelier-npm/node_modules/@openai/codex/bin/codex.js /home/agent/.local/bin/codex \
+    && ln -s /home/agent/.local/lib/atelier-npm/node_modules/@mariozechner/pi-coding-agent/dist/cli.js /home/agent/.local/bin/pi
+
+WORKDIR /work
+
+# No ENTRYPOINT: persistent containers are attached to with `podman exec
+# -it ... bash` (AUDIT.md §2), so CMD only needs to keep the container
+# alive as a foreground no-op. `--init` at run time (AUDIT.md §4.3) adds
+# catatonit as PID 1 to reap zombies from exec'd shells.
+CMD ["sleep", "infinity"]

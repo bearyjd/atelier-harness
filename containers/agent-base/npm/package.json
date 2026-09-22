@@ -1,0 +1,11 @@
+{
+  "name": "atelier-agent-base-npm",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned npm dependencies for agent-base (codex, pi, pi-flow). Not published; installed into /home/agent/.local/lib/atelier-npm via `npm ci --ignore-scripts` so the full dependency graph, not just these three top-level versions, is locked by package-lock.json.",
+  "dependencies": {
+    "@openai/codex": "0.155.1",
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@kky42/pi-flow": "3.1.3"
+  }
+}

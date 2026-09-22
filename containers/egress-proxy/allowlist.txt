@@ -1,0 +1,26 @@
+# Base egress allow-list (AUDIT.md §4.2). One hostname per line; lines
+# starting with # and blank lines are ignored. entrypoint.sh anchors each
+# hostname (^host$) before handing it to tinyproxy's Filter, so entries
+# here match exactly that hostname and nothing else (no substring or
+# subdomain matches unless the subdomain is listed explicitly).
+#
+# Per-project overlays extend this list by adding another *.txt file to
+# /etc/tinyproxy/allowlist.d/ in a derived image; entrypoint.sh
+# concatenates every file in that directory at container start.
+
+# Anthropic (Claude Code CLI + telemetry)
+api.anthropic.com
+# statsig.anthropic.com -- removed 2026-09-21: confirmed NXDOMAIN against
+# public DNS (1.1.1.1 and 8.8.8.8, via `dig`) as of that date. Re-add once
+# the actual telemetry hostname is confirmed against a working client.
+
+# OpenAI (Codex CLI + auth)
+api.openai.com
+chatgpt.com
+auth.openai.com
+
+# GitHub (git, gh CLI, source/release downloads)
+github.com
+api.github.com
+objects.githubusercontent.com
+codeload.github.com

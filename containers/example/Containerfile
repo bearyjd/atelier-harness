@@ -1,0 +1,37 @@
+# containers/example: reference per-project overlay (README.md "Overlay
+# convention"). Not a real project sandbox -- copy this directory as the
+# starting point for one. Adds two small, real tools on top of
+# agent-base: jq (JSON) and ripgrep (fast search), using the same dnf
+# flags agent-base's own install layer uses, so an overlay image doesn't
+# silently pull in weak/recommended deps the base image deliberately
+# avoids.
+FROM agent-base:latest
+
+# Populated by `just build <project>` the same way build-base populates
+# them (AUDIT.md §3.1/§3.2): SOURCE_SHA covers this overlay's own files
+# AND agent-base's Containerfile + installer, so a base rebuild marks
+# every overlay built on top of it stale too.
+ARG SOURCE_SHA=unknown
+ARG BUILD_CREATED=""
+
+# agent-base already removed sudo and stripped setuid bits (AUDIT.md §6);
+# installing more packages needs root, then USER agent restores the
+# non-root posture before the image is ever run.
+USER root
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+      jq \
+      ripgrep \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum
+
+LABEL org.atelier.source-sha="${SOURCE_SHA}" \
+      org.opencontainers.image.source="https://github.com/bearyjd/atelier-harness" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
+      org.opencontainers.image.title="agent-example" \
+      org.opencontainers.image.description="Reference per-project overlay on agent-base: adds jq and ripgrep. See containers/example/ for the convention to copy."
+
+# No ENTRYPOINT here either -- inherited from agent-base (unset), which
+# keeps CMD ["sleep","infinity"] as the foreground no-op persistent
+# containers need for `podman exec -it` to attach on demand.
+USER agent

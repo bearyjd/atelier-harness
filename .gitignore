@@ -1,0 +1,14 @@
+# Scratch / build output
+*.log
+*.tmp
+.DS_Store
+
+# Anything an agent might accidentally drop here while testing
+/scratch/
+/tmp/
+
+# Agent-orchestration session state (telemetry, replay logs, a sqlite
+# lock database) -- not repo content, grows unbounded, never meant to be
+# committed. Caught before the first commit (security review MEDIUM /
+# critic M11).
+/.omc/

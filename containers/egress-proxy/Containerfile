@@ -1,0 +1,74 @@
+# atelier-egress: forward proxy (tinyproxy) enforcing a hostname
+# allow-list for Atelier agent containers (AUDIT.md §4.2). One long-lived
+# instance sits on both the default Podman network and the `--internal`
+# atelier-internal network; agent containers on the "proxied" profile get
+# HTTPS_PROXY=http://atelier-egress:3128 and can reach only allow-listed
+# hosts. See tinyproxy.conf for the exact invariant this enforces (the
+# allow-list applies to every method; CONNECT is limited to port 443;
+# plain-HTTP forward-proxy requests to an allow-listed host are not
+# port-restricted -- tinyproxy has no directive for that).
+FROM registry.fedoraproject.org/fedora@sha256:dee2b968c71a167b08a6e0027db0380fc2f037796aeed620556a4fcbc6a1ed7f
+
+ARG SOURCE_SHA=unknown
+ARG BUILD_CREATED=""
+
+RUN dnf install -y --setopt=install_weak_deps=False tinyproxy \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum
+
+# /etc/nsswitch.conf ships with "hosts: files myhostname resolve
+# [!UNAVAIL=return] dns". The "resolve" module talks to systemd-resolved
+# over D-Bus; this container never runs systemd-resolved (no
+# /run/systemd/resolve stub socket exists here), and depending on
+# exactly how that unavailability is reported, [!UNAVAIL=return] either
+# correctly falls through to "dns" or short-circuits and reports the
+# lookup as failed WITHOUT ever trying "dns" -- verified empirically
+# 2026-09-22: identical `getent hosts api.github.com` calls against an
+# identical container alternated between succeeding and failing with
+# "Name or service not known", with nothing else different. tinyproxy's
+# own DNS resolution goes through the same NSS chain and failed the same
+# way, which is what surfaced this (a live smoke-test run that had
+# passed moments earlier failed on a freshly recreated container).
+# Dropping "myhostname resolve" and going straight to "files dns" removes
+# the flaky module entirely rather than hoping the timing favours the
+# right branch. This must happen here, as root, before USER tinyproxy
+# below -- /etc is not writable by the tinyproxy user, and the running
+# container is --read-only besides.
+RUN sed -i 's/^hosts:.*/hosts:      files dns/' /etc/nsswitch.conf
+
+# Base allow-list (AUDIT.md §4.2), UNIONED with every per-project
+# allowlist.txt in this repo (README.md "Overlay convention") -- one
+# shared proxy serves every agent container, so a host any project's
+# overlay needs must be reachable by all of them. The Justfile's
+# build-egress recipe stages 00-base.txt (this dir's own allowlist.txt)
+# plus a <project>.txt per containers/<project>/allowlist.txt into a temp
+# directory and passes it here as the "allowlists" named build context
+# (`--build-context allowlists=...`), so this Containerfile never reaches
+# outside its own build context directory. entrypoint.sh concatenates and
+# anchors every *.txt file it finds under /etc/tinyproxy/allowlist.d/ into
+# tinyproxy's filter at container start -- a runtime hook point, not a
+# one-shot bake, so editing an allowlist and rebuilding actually changes
+# what the running proxy allows once `just egress-up` picks up the new
+# source-sha and recreates the container.
+RUN mkdir -p /etc/tinyproxy/allowlist.d
+COPY --from=allowlists . /etc/tinyproxy/allowlist.d/
+COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+LABEL org.atelier.source-sha="${SOURCE_SHA}" \
+      org.opencontainers.image.source="https://github.com/bearyjd/atelier-harness" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
+      org.opencontainers.image.title="atelier-egress" \
+      org.opencontainers.image.description="Forward proxy (tinyproxy) enforcing a hostname allow-list for Atelier agent containers; CONNECT is limited to port 443, see tinyproxy.conf for the full invariant."
+
+# `dnf install tinyproxy` creates a dedicated system user/group (uid/gid
+# 999) for the daemon. Run as that user natively via USER -- tinyproxy.conf
+# deliberately has no User/Group directive, since the post-bind
+# setuid/setgid tinyproxy normally does as root would be a no-op (and log
+# a warning) once the process is already non-root.
+USER tinyproxy
+
+EXPOSE 3128
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
