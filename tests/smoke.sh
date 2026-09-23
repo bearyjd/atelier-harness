@@ -44,7 +44,7 @@ PROBE_IP="1.1.1.1"
 
 CLAUDE_VERSION="2.1.278"
 CODEX_VERSION="0.155.1"
-PI_VERSION="0.73.1"
+PI_VERSION="0.87.1"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -270,19 +270,18 @@ version_check PI "$PI_VERSION"
 grammar_check GH gh '^gh version [0-9]+\.[0-9]+\.[0-9]+'
 grammar_check GIT git '^git version [0-9]+\.[0-9]+\.[0-9]+'
 
-# The `pi` symlink must resolve into @mariozechner/pi-coding-agent
-# specifically. node_modules/.bin/pi (not used here, see Containerfile)
-# resolved to @earendil-works/pi-coding-agent instead -- a DIFFERENT
-# package that also ships a `pi` bin and won npm's hoisting. `pi
-# --version` returning "0.73.1" cannot by itself distinguish the pinned
-# package from that other one if they ever report the same version
-# string; this checks the actual symlink target, which is the assertion
-# that would have caught the mismatch (advisor review, 2026-09-22).
+# The `pi` symlink must resolve into @earendil-works/pi-coding-agent
+# specifically -- the pinned package, and the actively maintained
+# successor to @mariozechner/pi-coding-agent (deprecated 2026-05-07;
+# this repo pinned the deprecated one until 2026-09-22). `pi --version`
+# alone cannot distinguish which package actually produced the binary if
+# two co-installed packages both ship a `pi` command and happen to report
+# the same version string; this checks the actual symlink target.
 PI_SYMLINK_VAL="$(echo "$VERSIONS_OUT" | grep '^PI_SYMLINK=' | cut -d= -f2-)"
-if [[ "$PI_SYMLINK_VAL" == *"@mariozechner/pi-coding-agent"* ]]; then
-  pass "~/.local/bin/pi resolves into @mariozechner/pi-coding-agent, not a same-named bin from another package (${PI_SYMLINK_VAL})"
+if [[ "$PI_SYMLINK_VAL" == *"@earendil-works/pi-coding-agent"* ]]; then
+  pass "~/.local/bin/pi resolves into @earendil-works/pi-coding-agent, not a same-named bin from another package (${PI_SYMLINK_VAL})"
 else
-  fail "~/.local/bin/pi resolves into @mariozechner/pi-coding-agent (got: ${PI_SYMLINK_VAL})"
+  fail "~/.local/bin/pi resolves into @earendil-works/pi-coding-agent (got: ${PI_SYMLINK_VAL})"
 fi
 
 PIFLOW_VERSION_VAL="$(echo "$VERSIONS_OUT" | grep '^PIFLOW_VERSION=' | cut -d= -f2-)"

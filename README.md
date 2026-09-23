@@ -52,7 +52,7 @@ inside a container anyway, mount it read-only.
 | Humans read | `agent-<project>:latest` (mutable, tracks the daily driver) and `:<YYYYMMDD>` (by convention immutable) |
 | Auth volumes | Five named volumes, never `$HOME` bind mounts (see below): `atelier-auth-claude`, `atelier-auth-codex` (both read-write, either consumer); `atelier-auth-gh` (the owner's interactive `hosts.yml`, mounted **only** by `agent-enter.sh` -- an unattended process must never see it, since it can push to every repo the owner can write to); `atelier-auth-gh-publish` and `atelier-auth-gh-review`, reserved for owner-minted fine-grained GitHub PATs that Meute populates and mounts read-only (scopes: AUDIT.md §4.1 -- `contents:write`/`pull_requests:write` on fleet repos only for `-publish`; `contents:read` + `pull_requests:write` for comments + `checks:read` for `-review`) |
 | Network profiles | `none` (`--network=none`; for runs that never call a model at all -- an in-container auth preflight, a local build/test step) and `proxied` (joins the `atelier-internal` network behind the `atelier-egress` proxy; **every Meute engine run is `proxied`**, since every engine run is a `claude -p` or `codex exec` call). `atelier-internal` is created with `--disable-dns` (deterministic `/etc/resolv.conf`, see below), so the proxied profile also adds `--add-host atelier-egress:<ip>` -- the name is no longer resolvable by DNS on that network at all. |
-| Proxy value | `HTTPS_PROXY=http://atelier-egress:3128` (and the same for `HTTP_PROXY`); `NO_PROXY=localhost,127.0.0.1` (and lowercase); only how the name resolves changed, from DNS to the static `--add-host` entry above |
+| Proxy value | All four of `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` set to `http://atelier-egress:3128`, plus `NO_PROXY`/`no_proxy=localhost,127.0.0.1`. curl ignores uppercase `HTTP_PROXY` by design (CGI safety) and honours `HTTPS_PROXY`; plain-http fetches such as a git http remote or an npm mirror need the lowercase `http_proxy`, otherwise they fail closed with curl rc=6 rather than bypassing the allow-list. Measured by Meute on `agent-base:g691e067` with curl 8.18.0. Only how the `atelier-egress` name resolves changed, from DNS to the static `--add-host` entry above |
 
 Registry: local-only for now (images are unqualified `agent-<project>`,
 resolved as `localhost/agent-<project>` by Podman). Nothing here embeds
@@ -369,7 +369,7 @@ CLI presence with both an exit-0 check and a version-string grammar
 check (not just "the output is nonempty" -- a missing binary's shell
 error is nonempty too), `pi-flow`'s *exact* pinned version via
 `npm ls @kky42/pi-flow --json`, and that `~/.local/bin/pi` actually
-resolves into `@mariozechner/pi-coding-agent` rather than a same-named
+resolves into `@earendil-works/pi-coding-agent` rather than a same-named
 bin from another package. It exercises `scripts/auth-import.sh` twice in
 a row against the same throwaway volume with two distinct probe files
 and asserts only the second remains (proving rotation replaces rather
@@ -471,12 +471,28 @@ at build time). To bump `codex`, `pi`, or `pi-flow`: edit
 also **not** pinned -- they ride whatever version the Fedora 44 base
 digest ships; re-pin the base digest to change them.
 
+`pi` is pinned to `@earendil-works/pi-coding-agent` (currently `0.87.1`),
+not `@mariozechner/pi-coding-agent`. The pin moved (2026-09-22):
+`@mariozechner/pi-coding-agent` was deprecated 2026-05-07 (`npm view`:
+"please use @earendil-works/pi-coding-agent instead going forward") and
+carries three known advisories on every version up to and including
+`0.73.1`, the version this repo had pinned until Renovate's dashboard
+flagged the deprecation; `npm audit` against the successor at `0.87.1`
+reports zero. `@kky42/pi-flow` peer-depends on the `@earendil-works`
+packages directly (`pi-coding-agent`, `pi-agent-core`, `pi-ai`, `pi-tui`),
+which is why `@earendil-works/pi-coding-agent` was already present in the
+installed tree even back when only the deprecated package was pinned at
+the top level -- pinning the successor directly means the package
+`pi-flow` expects and the package `pi` actually runs from are the same
+one.
+
 `codex` and `pi` are installed to `~/.local/bin/` as symlinks constructed
-from each package's own `bin` field, not from `node_modules/.bin/`:
-`.bin/pi` resolves to `@earendil-works/pi-coding-agent`'s binary instead
-of the pinned `@mariozechner/pi-coding-agent`'s, since both packages ship
-a `pi` command and npm's hoisting picked the other one. Using `.bin/`
-would have silently unpinned `pi`.
+from each package's own `bin` field, not from `node_modules/.bin/` --
+not because `node_modules/.bin/pi` resolves to the wrong package (it
+resolves to `@earendil-works/pi-coding-agent` too, correctly), but
+because which package's bin entry wins npm's hoisting is an accident of
+install order, not a decision recorded anywhere. Pinning the symlink
+target explicitly in the Containerfile makes it one.
 
 `pi-flow` (`@kky42/pi-flow`) has no `bin` entry and installs no
 executable of its own -- it is a library `pi` loads, not a CLI you invoke

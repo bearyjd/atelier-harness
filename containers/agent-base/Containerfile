@@ -188,18 +188,38 @@ COPY --chown=agent:agent npm/package.json npm/package-lock.json /home/agent/.loc
 RUN cd /home/agent/.local/lib/atelier-npm \
     && npm ci --ignore-scripts
 
-# The three packages' executables are symlinked into ~/.local/bin
+# The pi package pin is `@earendil-works/pi-coding-agent`, not
+# `@mariozechner/pi-coding-agent`. CORRECTION (2026-09-22): this repo
+# pinned `@mariozechner/pi-coding-agent` through the Codex review round,
+# and at the time read `node_modules/.bin/pi` resolving to
+# `@earendil-works/pi-coding-agent` instead as npm's hoisting having
+# picked "the wrong package" -- worth symlinking around explicitly. That
+# story was wrong in one respect: `@earendil-works/pi-coding-agent` was
+# never an impostor. `@mariozechner/pi-coding-agent` is the deprecated
+# predecessor (deprecated 2026-05-07, `npm view` says "please use
+# @earendil-works/pi-coding-agent instead going forward"), and
+# `@kky42/pi-flow` peer-depends on the `@earendil-works` packages
+# directly (`pi-coding-agent`, `pi-agent-core`, `pi-ai`, `pi-tui`, all
+# `*`) -- which is *why* it was already present in the tree even when
+# only the deprecated package was pinned at the top level. Pinning the
+# successor directly means the tree pi-flow expects and the tree `pi`
+# actually runs from are the same one, and `npm audit` on it (verified
+# 2026-09-22) reports zero known vulnerabilities, versus three affecting
+# every version of the deprecated package up to and including the one
+# this repo had pinned.
+#
+# The packages' executables are still symlinked into ~/.local/bin
 # individually, from each package's OWN `bin` field, rather than via
-# `node_modules/.bin`. This is not cosmetic: `node_modules/.bin/pi`
-# resolved to `@earendil-works/pi-coding-agent`'s `pi` binary, not the
-# pinned `@mariozechner/pi-coding-agent`'s -- npm's hoisting picked
-# whichever of the two co-installed packages happened to win the name,
-# silently unpinning `pi` if that path had been used. Verified 2026-09-22.
+# `node_modules/.bin` -- not because `.bin/pi` was ever wrong, but
+# because relying on whichever package's bin entry happens to win
+# npm's hoisting is fragile regardless of which one currently wins;
+# pinning the symlink target explicitly makes the choice a decision
+# recorded in this file, not an accident of install order.
 # `pi-flow` has no `bin` entry at all (confirmed via its package.json) --
 # it's a library `pi` loads via node's normal module resolution from the
 # same node_modules tree, not a command.
 RUN ln -s /home/agent/.local/lib/atelier-npm/node_modules/@openai/codex/bin/codex.js /home/agent/.local/bin/codex \
-    && ln -s /home/agent/.local/lib/atelier-npm/node_modules/@mariozechner/pi-coding-agent/dist/cli.js /home/agent/.local/bin/pi
+    && ln -s /home/agent/.local/lib/atelier-npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js /home/agent/.local/bin/pi
 
 WORKDIR /work
 

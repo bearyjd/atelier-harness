@@ -36,7 +36,7 @@ start until the owner supplies it (Section 4.6).
 | `gh` | not on host; 2.87.3 in the `dev` distrobox (`/usr/bin/gh`) | Agent containers still need their own copy; corrected 2026-09-22, the Phase 0 table wrongly said it was absent everywhere |
 | `claude` | 2.1.278, native installer (`~/.local/share/claude/versions/2.1.278`) | Installer accepts an exact version arg: `install.sh 2.1.278` — verified by reading the script |
 | `codex` | `@openai/codex` 0.155.1 via npm | Ships a platform binary behind a `#!/usr/bin/env node` shim, so node is a **runtime** dependency (corrected 2026-09-22; on the node-less host `codex --version` fails) |
-| `pi` | `@mariozechner/pi-coding-agent` 0.73.1 on npm (not installed locally) | Needs node at runtime |
+| `pi` | `@earendil-works/pi-coding-agent` 0.87.1 on npm (corrected 2026-09-22: the Phase 0 pin `@mariozechner/pi-coding-agent` 0.73.1 had been deprecated in favour of this package since 2026-05-07; Renovate's dashboard caught it) | Needs node at runtime; `pi-flow` peer-depends on this package, which is why it appeared in the Phase 1 tree |
 | `pi-flow` | `@kky42/pi-flow` 3.1.3 on npm (owner confirmed 2026-09-21) | A library consumed by `pi`; ships **no executable**, so it is verified with `npm ls -g`, not `--version` |
 | ghcr.io | not logged in on Tower | Local-only is the zero-setup option (Section 3.3) |
 | Existing `agent-*` images | none | Clean namespace |
@@ -506,20 +506,23 @@ label). Renaming before the first push is a one-line label change.
   `org.atelier.source-sha` therefore means "built from these inputs", not
   "bit-identical". Accepted; a locked RPM snapshot is out of proportion
   for this repo.
+- Pins are exact `ARG`s and Renovate (`renovate.json`, app enabled
+  2026-09-22) tracks the Fedora 44 digest and the npm pins; the dashboard
+  also surfaces deprecations, which is how the `pi` pin was caught.
 - The Claude installer bootstrap fetched a mutable `latest` binary before
   installing the pinned version (Codex finding). Fixed by downloading the
   exact-version binary directly and verifying a sha256 recorded in the
   Containerfile; the vendored script is no longer executed.
 - npm installs are locked with a committed lockfile and `npm ci
   --ignore-scripts`, so the transitive graph is pinned, not just the three
-  top-level versions. `npm audit` on that lockfile (2026-09-21) reports
-  open advisories against the pinned `@mariozechner/pi-coding-agent`
-  0.73.1 itself (predictable temp paths for extension installs, a race on
-  its `auth.json` writes, XSS in HTML session exports) and its transitive
-  `extract-zip` (symlink path traversal). 0.73.1 is the newest release, so
-  no fixed version exists to pin. Known and accepted; the container
-  boundary is the mitigation, and the pin should move when upstream ships
-  a fix. `codex` and `pi-flow` have no open advisories.
+  top-level versions. `npm audit` on the 2026-09-21 lockfile reported
+  open advisories against `@mariozechner/pi-coding-agent` 0.73.1 and its
+  transitive `extract-zip`, with no fixed version in range. The reason was
+  that the package itself was deprecated: its successor
+  `@earendil-works/pi-coding-agent` (0.87.1 as of 2026-09-22) audits
+  clean. The pin moved to the successor; the Phase 1 "hoisting picked the
+  wrong package" workaround, which forced the `pi` symlink back to the
+  deprecated package, was the wrong call and is reversed.
 - `ENV CLAUDE_CONFIG_DIR=/home/agent/.claude` so all Claude state lives in
   the auth volume. Proxy variables are declared in both cases
   (`HTTPS_PROXY` and `https_proxy`): curl ignores uppercase `HTTP_PROXY`.
