@@ -7,7 +7,7 @@
 # allow-list applies to every method; CONNECT is limited to port 443;
 # plain-HTTP forward-proxy requests to an allow-listed host are not
 # port-restricted -- tinyproxy has no directive for that).
-FROM registry.fedoraproject.org/fedora@sha256:dee2b968c71a167b08a6e0027db0380fc2f037796aeed620556a4fcbc6a1ed7f
+FROM registry.fedoraproject.org/fedora:44@sha256:dee2b968c71a167b08a6e0027db0380fc2f037796aeed620556a4fcbc6a1ed7f
 
 ARG SOURCE_SHA=unknown
 ARG BUILD_CREATED=""

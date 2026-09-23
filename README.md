@@ -442,6 +442,14 @@ to a dead pane.
 
 ## Version pins
 
+Dependency updates are wired for [Renovate](https://docs.renovatebot.com/)
+in `renovate.json`: the Fedora base digest (minor/patch only, a major bump
+is a deliberate decision) and the three npm-pinned CLIs with their
+lockfile. It only runs once the Renovate GitHub app is enabled on this
+repository. `CLAUDE_VERSION` and `CLAUDE_BINARY_SHA256` are bumped by
+hand because the binary hash must be re-derived from the release
+manifest.
+
 `claude` installs as a native binary (see below) and needs no runtime
 beyond libc. `nodejs24` stays in the image anyway, because `codex` and
 `pi` ship as npm packages whose `codex`/`pi` executables are Node shims

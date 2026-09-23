@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "schedule:weekly"],
+  "description": "Keeps the digest-pinned Fedora base and the npm-pinned CLIs current. Requires the Renovate GitHub app on this repo. CLAUDE_VERSION and CLAUDE_BINARY_SHA256 in containers/agent-base/Containerfile are bumped by hand: the binary hash has to be re-derived from the release manifest, which Renovate cannot do.",
+  "dockerfile": {
+    "enabled": true,
+    "managerFilePatterns": ["/(^|/)Containerfile$/"]
+  },
+  "npm": {
+    "enabled": true,
+    "managerFilePatterns": ["/^containers/agent-base/npm/package\\.json$/"],
+    "rangeStrategy": "pin"
+  },
+  "packageRules": [
+    {
+      "description": "Base image: follow Fedora 44 by digest only; a major bump is a deliberate decision recorded in AUDIT.md.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["registry.fedoraproject.org/fedora"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "agent-base:latest is built locally, never fetched from a registry.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["agent-base"],
+      "enabled": false
+    }
+  ]
+}

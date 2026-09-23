@@ -7,7 +7,7 @@
 #
 # Base image is pinned by digest (matches the host and the `dev`
 # distrobox; verified 2026-09-21 against registry.fedoraproject.org).
-FROM registry.fedoraproject.org/fedora@sha256:dee2b968c71a167b08a6e0027db0380fc2f037796aeed620556a4fcbc6a1ed7f
+FROM registry.fedoraproject.org/fedora:44@sha256:dee2b968c71a167b08a6e0027db0380fc2f037796aeed620556a4fcbc6a1ed7f
 
 # ARGs must come after FROM to stay in scope for the rest of the file --
 # an ARG declared before FROM is only visible to the FROM line itself.
