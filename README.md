@@ -125,7 +125,16 @@ no-op that persistent containers need.
 `just build <project>` produces the same three tags as `build-base`
 (`agent-<project>:latest`, `:<YYYYMMDD>`, `:g<sha>` when `HEAD` resolves
 and the tree is clean -- AUDIT.md §3.2), and requires `agent-base:latest`
-to already exist. Its `SOURCE_SHA` manifest covers the overlay's own files
+to already exist.
+
+Two consequences of that scheme, observed on the first day: a rebuild of
+the same commit does **not** reproduce a digest (the build timestamp is a
+label), so `latest` and `g<sha>` can point at different image IDs within
+minutes of each other -- do not read `podman images` as "the g-tag is what
+I just built". And because Meute asserts the digest, never force-retag an
+existing `g<sha>` onto a new build: every Meute pin on it would decline
+with image drift until someone runs its `image bump`, which is the
+intended behaviour of an immutable tag. Its `SOURCE_SHA` manifest covers the overlay's own files
 *and* every file under `containers/agent-base/` (enumerated at build time,
 not a hardcoded file list, so it survives agent-base's own file set
 changing shape -- it already has once, when the vendored installer script
