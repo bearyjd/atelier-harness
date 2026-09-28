@@ -300,10 +300,18 @@ Accepted residuals and open options:
   is not contained by deleting the secret: revoke it server-side
   (claude.ai), then `just auth-login claude` and restart or remove the
   consuming containers.
-- `atelier-auth-claude` still holds the old, now-revoked
-  `.credentials.json` from `just auth`. Left in place deliberately: Meute
-  mounts that volume, so changing its contents is a contract change, and
-  `CLAUDE_CODE_OAUTH_TOKEN` takes precedence over it anyway.
+- The `.credentials.json` that `just auth` had copied into
+  `atelier-auth-claude` was removed on 2026-09-27, with the owner's
+  approval and after Meute was told; the rest of the volume (settings,
+  history) was kept. Leaving it was first justified by
+  `CLAUDE_CODE_OAUTH_TOKEN` taking precedence. Meute then pointed out
+  that a `--network=none` `claude auth status` preflight would read the
+  stale file and report `loggedIn: true` for a credential the real run
+  never uses. There was also a worse case: any run missing the secret
+  falls back to the copy, and a refresh there revokes the host's token,
+  which is the original race. With the file gone, a container is
+  authenticated by the secret or not at all. Meute's preflight checks the
+  secret host-side (`podman secret inspect atelier-claude-token`).
 - gh's own help warns against passing a fine-grained PAT to
   `--with-token` and favours `GH_TOKEN`. Accepted for now because the
   contract *mounts* the gh volumes; moving Meute to a `GH_TOKEN` secret is
