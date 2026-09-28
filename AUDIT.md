@@ -161,6 +161,9 @@ containers, and can be wiped with one `podman volume rm`.
 Why not `podman secret` / API-key env vars: the owner is on a subscription
 (OAuth), not API billing; Meute's whole cost model (PRP-001) is "work the
 subscription already paid for". API keys would change that model.
+(Superseded in part, 2026-09-27: Claude now does use a Podman secret,
+but holding a `claude setup-token` *subscription* token, not an API key,
+so the cost model is unchanged. See "Built" below.)
 
 **Trade-off the owner should know:** an agent inside the container can read
 its own OAuth token. This is true of every agent sandbox that uses
@@ -210,7 +213,7 @@ and `atelier-auth-gh-review` (`contents:read`, `pull_requests:write` for
 comments, `checks:read`). `scripts/auth-import.sh <volume> <file>` is
 generic so any of the five volumes can be filled the same way.
 
-**OAuth refresh race (open, owner decision pending).** Meute's log already
+**OAuth refresh race (resolved by `just auth-login`, see "Built" below).** Meute's log already
 shows `Failed to refresh OAuth token: another Claude Code process is
 refreshing it` with everything on the host sharing one
 `~/.claude/.credentials.json`. If the provider rotates refresh tokens on
@@ -232,16 +235,79 @@ shape and is unaffected only because its volume has not been refreshed
 out from under it yet. Conclusion: **`just auth` is wrong for Claude and
 Codex** and stays only for `gh`, whose tokens do not rotate.
 
-Design for `just auth-login`, from the CLIs' own options rather than
-assumption: `claude setup-token` issues a long-lived subscription token
-consumed via `CLAUDE_CODE_OAUTH_TOKEN`; stored as a Podman secret and
-injected as an environment variable at `podman run`, it removes refresh
-from the container side entirely, so the failure cannot recur rather
-than being made less likely. `codex login --device-auth` runs inside a
-container with the codex volume mounted, giving that volume its own
-refresh pair that is never duplicated. `gh auth login --with-token`
-takes a PAT on stdin into the gh volumes. Each is one bounded command
-with the owner at a browser for the Claude and Codex steps.
+**Built (2026-09-27): `just auth-login`**, designed from the CLIs' own
+options rather than assumption, in `scripts/auth-login.sh`:
+
+- **claude** — the owner runs `claude setup-token` *on the host* (its
+  browser OAuth flow needs hosts the egress allow-list deliberately does
+  not include; the allow-list was not widened) and pastes the long-lived
+  subscription token. It is stored with `podman secret create --replace
+  atelier-claude-token -`, stdin only, never argv or env. `agent-enter.sh`
+  injects it on `proxied` runs as `--secret
+  atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN`; `none`
+  never gets it. No refresh happens container-side, so the revocation
+  cannot recur rather than being made less likely. Verified on podman
+  5.8.7: the env value is resolved at container *start* (rotation is
+  `--replace` plus a restart, not a recreate); the value never appears in
+  `podman inspect`; a deleted secret makes `podman start` fail, so
+  `agent-enter.sh` refuses that case (and a proxied container created
+  before the secret existed) with exit 4. The only inspect field that
+  records an env-type secret is `.Config.CreateCommand`; `.Config.Secrets`
+  lists mount-type secrets only.
+- **codex** — `codex login --device-auth` inside a hardened, `--read-only`
+  container on the proxied network with `atelier-auth-codex` mounted, so
+  that volume holds its own refresh pair, never duplicated. The volume is
+  not recreated (config and sessions live there too) and `codex logout`
+  is never run: it could revoke a refresh token still shared with the
+  host's copied `auth.json`.
+- **gh** — `gh auth login --with-token` with a PAT on stdin into exactly
+  one of `atelier-auth-gh`, `atelier-auth-gh-publish`,
+  `atelier-auth-gh-review`. The login and `gh auth status` run against
+  a staging volume first; only on success is the target recreated (so
+  `hosts.yml` never mixes identities -- recent gh appends accounts) and
+  the staged state copied in, so a bad PAT never destroys the working
+  credential. Networked login containers always run `agent-base:latest`,
+  never an `ATELIER_AUTH_IMAGE` override.
+- **No TTY on stdin-fed calls (found in review 2026-09-27):** inside the
+  `dev` distrobox, `distrobox-host-exec` gives host-spawn a pty whenever
+  stdout is a TTY; a credential piped on stdin was echoed in cleartext
+  and the call hung waiting for EOF. Every stdin-fed podman call
+  (`auth-import.sh`'s tar pipe, the gh login, the claude `secret
+  create`) now has a non-TTY stdout, and `tests/smoke.sh` runs two of
+  them under a real pty with a canary.
+
+`just auth` now copies only `~/.config/gh/hosts.yml`. The smoke suites
+cover the claude path end to end with a dummy token and a throwaway
+secret name, the argument refusals (unknown tool, non-allowed or
+missing gh volume), the missing-proxy refusal, the pty echo/hang case,
+and all three `agent-enter.sh` secret refusals on reuse; the real
+browser/device/PAT logins cannot run headless and are not faked, and the
+gh staging swap was checked by hand (a bogus PAT fails with HTTP 401 and
+leaves no volume behind; the copy keeps `agent:agent` 0600).
+
+Accepted residuals and open options:
+
+- Podman's default `file` secret driver stores the value in plaintext
+  (mode 0600) under the user's container storage, and `podman secret
+  inspect --showsecret` reveals it to the same user. That is the same
+  trust level as `~/.claude/.credentials.json` on the host today.
+- Once a container is created with the env secret, the value also sits
+  in plaintext in that container's
+  `overlay-containers/<id>/userdata/config.json` (mode 0644 inside a 0700
+  directory, verified 2026-09-27) and in `/proc/<pid>/environ` for the
+  life of the container. `podman secret rm` or `--replace` does not purge
+  either until the container is restarted or removed. So a leaked token
+  is not contained by deleting the secret: revoke it server-side
+  (claude.ai), then `just auth-login claude` and restart or remove the
+  consuming containers.
+- `atelier-auth-claude` still holds the old, now-revoked
+  `.credentials.json` from `just auth`. Left in place deliberately: Meute
+  mounts that volume, so changing its contents is a contract change, and
+  `CLAUDE_CODE_OAUTH_TOKEN` takes precedence over it anyway.
+- gh's own help warns against passing a fine-grained PAT to
+  `--with-token` and favours `GH_TOKEN`. Accepted for now because the
+  contract *mounts* the gh volumes; moving Meute to a `GH_TOKEN` secret is
+  an open option for the owner, since it changes the contract.
 
 **Ephemeral Meute containers** mount `atelier-auth-claude` and
 `atelier-auth-codex` read-write (both CLIs write to their dirs) and one of
@@ -690,11 +756,11 @@ IP literals and wildcards; `--network=none` on credential extraction;
 `|| true` in production scripts; repo labels reset; README contract
 complete. **Phases 1 and 2 are complete against this audit.**
 
-Still open, all owner items: run `just auth` or choose the per-volume
-login design (§4.1); mint Meute's two PATs; the first real interactive
-`agent-enter <project>` with a terminal (the tmux attach itself cannot be
-exercised headless); a `just auth-login` recipe if Meute's refresh-race
-test shows copied tokens invalidate; bump the `pi` pin when upstream
+Still open, all owner items: run `just auth-login claude`, `just
+auth-login codex` and `just auth` (gh) (§4.1; the recipe itself was
+built 2026-09-27 after the refresh race was confirmed); mint Meute's two
+PATs; the first real interactive `agent-enter <project>` with a terminal
+(the tmux attach itself cannot be exercised headless); bump the `pi` pin when upstream
 ships fixes for its open advisories (§6). Accepted residuals: plain-HTTP
 relay to allow-listed hosts, CDN co-tenancy through CONNECT, mutable dnf
 metadata, DNS rebinding (§4.2, §6).

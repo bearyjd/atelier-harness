@@ -372,7 +372,7 @@ egress-down:
         echo "network {{egress_network}} does not exist"
     fi
 
-# Populate the three auth volumes from the owner's host credential files.
+# Populate atelier-auth-gh from the owner's host ~/.config/gh/hosts.yml (claude/codex: use auth-login).
 auth:
     #!/usr/bin/env bash
     # Named volumes, never a bind mount of $HOME (AUDIT.md §4.1):
@@ -380,31 +380,48 @@ auth:
     # config, and bind-mounting just the credentials file breaks when a
     # CLI rotates its OAuth token by rename-over-write.
     #
+    # gh ONLY, since 2026-09-27. Claude and Codex were removed because a
+    # COPIED OAuth credential is revoked the moment the host refreshes its
+    # own copy -- refresh is single-use, so the host and the volume
+    # invalidate each other (AUDIT.md §4.1 "Trigger met": Meute got
+    # `401 OAuth access token has been revoked` exactly this way on
+    # 2026-09-23). Those two now use `just auth-login claude|codex`, which
+    # gives the container side its own credential instead of a copy. gh's
+    # tokens do not rotate, so copying hosts.yml stays safe.
+    #
     # The actual import (and the uid-1000-under-keep-id subtlety) is
     # factored into scripts/auth-import.sh so tests/smoke.sh can exercise
     # the identical code path against a throwaway file and volume,
     # without ever touching real credentials.
     set -euo pipefail
     cd "{{justfile_directory()}}"
-
-    declare -A targets=(
-        [atelier-auth-claude]="${HOME}/.claude/.credentials.json"
-        [atelier-auth-codex]="${HOME}/.codex/auth.json"
-        [atelier-auth-gh]="${HOME}/.config/gh/hosts.yml"
-    )
-    imported=0
-    for volume in "${!targets[@]}"; do
-        src="${targets[$volume]}"
-        if [[ -f "$src" ]]; then
-            ./scripts/auth-import.sh "$volume" "$src"
-            imported=$((imported + 1))
-        else
-            echo "auth: SKIP ${volume} -- source not found: ${src}"
-        fi
-    done
-    echo
-    echo "auth: imported ${imported} of ${#targets[@]} credential files"
-    if [[ "$imported" -eq 0 ]]; then
-        echo "auth: FAILED -- no credential files were found to import" >&2
+    src="${HOME}/.config/gh/hosts.yml"
+    if [[ ! -f "$src" ]]; then
+        echo "auth: FAILED -- source not found: ${src} (or use: just auth-login gh atelier-auth-gh)" >&2
         exit 1
     fi
+    ./scripts/auth-import.sh atelier-auth-gh "$src"
+
+# Log in per tool: `auth-login claude`, `auth-login codex`, `auth-login gh <atelier-auth-gh|atelier-auth-gh-publish|atelier-auth-gh-review>`.
+auth-login tool volume="":
+    #!/usr/bin/env bash
+    # SECURITY: same rule as the `build` recipe above (Codex review,
+    # .omc/reviews/phase1-codex.md) -- just interpolates double-brace
+    # placeholders as raw text before bash parses the body, so each
+    # parameter is captured exactly once through quote() into a bash
+    # variable and never interpolated raw again. Validation (the tool
+    # name, the three allowed gh volume names) lives in
+    # scripts/auth-login.sh, the sole source of truth.
+    #
+    # The volume is appended only when non-empty: `volume` defaults to ""
+    # so `just auth-login claude` works, and passing that empty string on
+    # as a real second argument would trip the script's arg-count check.
+    set -euo pipefail
+    cd "{{justfile_directory()}}"
+    tool={{quote(tool)}}
+    volume={{quote(volume)}}
+    args=("$tool")
+    if [[ -n "$volume" ]]; then
+        args+=("$volume")
+    fi
+    ./scripts/auth-login.sh "${args[@]}"

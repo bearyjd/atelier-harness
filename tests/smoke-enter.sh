@@ -77,6 +77,20 @@ STALE_PROJECT="smoke-stale-$$"
 PREFLIGHT_PROJECT="smoke-preflight-$$"
 AUTHPOISON_PROJECT="smoke-authpoison-$$"
 AUTHPOISON_VOLUME="atelier-smoke-authpoison-vol-$$"
+SECRET_PROJECT="smoke-secret-$$"
+
+# Claude token secret (AUDIT.md §4.1): exported so EVERY agent-enter.sh
+# call in this suite resolves a throwaway name, never the real
+# atelier-claude-token -- once the owner has run `just auth-login claude`,
+# the real token would otherwise be injected into every proxied test
+# container. SMOKE_CLAUDE_SECRET is created up front (before section 2)
+# so the TEST_PROJECT reuse checks see a container created WITH it;
+# SMOKE_LATE_SECRET is a second name that starts absent, for the
+# "created without it, secret appears later" refusal in section 16.
+SMOKE_CLAUDE_SECRET="atelier-claude-token-smoke-enter-$$"
+SMOKE_LATE_SECRET="atelier-claude-token-smoke-late-$$"
+SMOKE_CLAUDE_TOKEN="smoke-enter-dummy-token-$$"
+export ATELIER_CLAUDE_SECRET="$SMOKE_CLAUDE_SECRET"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -93,10 +107,13 @@ cleanup() {
   local p
   for p in "$TEST_PROJECT" "$MISMATCH_PROJECT" "$NONE_PROJECT" \
            "$DOTTED_PROJECT" "$H6_PROJECT" "$STALE_PROJECT" \
-           "$PREFLIGHT_PROJECT" "$AUTHPOISON_PROJECT" "fake-checkout" "atelier-harness"; do
+           "$PREFLIGHT_PROJECT" "$AUTHPOISON_PROJECT" "$SECRET_PROJECT" \
+           "fake-checkout" "atelier-harness"; do
     "${PODMAN[@]}" rm -f "agent-${p}" >/dev/null 2>&1 || true
   done
   "${PODMAN[@]}" volume rm -f "$AUTHPOISON_VOLUME" >/dev/null 2>&1 || true
+  "${PODMAN[@]}" secret rm "$SMOKE_CLAUDE_SECRET" >/dev/null 2>&1 || true
+  "${PODMAN[@]}" secret rm "$SMOKE_LATE_SECRET" >/dev/null 2>&1 || true
   # just build tags :latest AND :<YYYYMMDD> on every build (Justfile
   # build recipe) -- both must go, not just :latest, or the date tag
   # accumulates as a stray image across runs (found in testing: two
@@ -156,6 +173,11 @@ if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null; then
   exit 1
 fi
 pass "no pre-existing ${CONTAINER} container"
+
+# Created directly with `podman secret create`, not via auth-login.sh:
+# tests/smoke.sh already covers auth-login.sh's own stdin handling, and
+# this suite is about what agent-enter.sh does with a secret that exists.
+printf '%s' "$SMOKE_CLAUDE_TOKEN" | "${PODMAN[@]}" secret create "$SMOKE_CLAUDE_SECRET" - >/dev/null
 
 # --- 1. Self-refusal: string-identity, filesystem-identity, and content --
 run_enter --dir "$REPO_ROOT" --no-tmux -- true
@@ -366,6 +388,24 @@ else
   fail "jq --version works (overlay tool present) (podman exec itself failed: ${JQ_OUT})"
 fi
 
+# Claude token secret (AUDIT.md §4.1): checked through agent-enter.sh's own
+# exec path (the one claude actually runs under), not `podman start -a`.
+# Length and value are measured inside the container so a stray trailing
+# newline cannot hide behind the host shell's `$(...)` stripping.
+run_enter --project "$TEST_PROJECT" --dir "$PROJECT_DIR" --no-tmux -- bash -c 'printf "%s:%s" "${#CLAUDE_CODE_OAUTH_TOKEN}" "${CLAUDE_CODE_OAUTH_TOKEN-__unset__}"'
+if [[ "$ENTER_EXIT" -eq 0 && "$ENTER_OUT" == "${#SMOKE_CLAUDE_TOKEN}:${SMOKE_CLAUDE_TOKEN}" ]]; then
+  pass "proxied profile injects the claude token secret as CLAUDE_CODE_OAUTH_TOKEN (byte-exact)"
+else
+  fail "proxied profile injects the claude token secret as CLAUDE_CODE_OAUTH_TOKEN (exit=${ENTER_EXIT}, got: ${ENTER_OUT})"
+fi
+
+INSPECT_ALL="$("${PODMAN[@]}" inspect "$CONTAINER" 2>&1)"
+if [[ -n "$INSPECT_ALL" && "$INSPECT_ALL" != *"$SMOKE_CLAUDE_TOKEN"* ]]; then
+  pass "podman inspect of the proxied container does not contain the token value"
+else
+  fail "podman inspect of the proxied container does not contain the token value (it does, or inspect was empty)"
+fi
+
 # --- 3. Second invocation reuses the container ------------------------------
 ID1="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.Id}}')"
 run_enter --project "$TEST_PROJECT" --dir "$PROJECT_DIR" --no-tmux -- true
@@ -523,6 +563,14 @@ if [[ "$NONE_ENV" != *'HTTPS_PROXY=http://'* ]]; then
   pass "--network=none: no proxy env injected"
 else
   fail "--network=none: no proxy env injected (got: ${NONE_ENV})"
+fi
+# The secret exists for this whole suite, so this proves `none` withholds
+# it by design rather than because there was nothing to inject.
+run_enter --project "$NONE_PROJECT" --dir "$NONE_DIR" --network none --no-tmux -- bash -c 'echo "TOKEN_SET=${CLAUDE_CODE_OAUTH_TOKEN+yes}"'
+if [[ "$ENTER_EXIT" -eq 0 && "$ENTER_OUT" == *"TOKEN_SET="* && "$ENTER_OUT" != *"TOKEN_SET=yes"* ]]; then
+  pass "--network=none: CLAUDE_CODE_OAUTH_TOKEN is not injected even though the secret exists"
+else
+  fail "--network=none: CLAUDE_CODE_OAUTH_TOKEN is not injected (exit=${ENTER_EXIT}, got: ${ENTER_OUT})"
 fi
 "${PODMAN[@]}" rm -f "agent-${NONE_PROJECT}" >/dev/null 2>&1 || true
 
@@ -688,6 +736,62 @@ fi
 unset AUTHPOISON_EXIT
 "${PODMAN[@]}" rm -f "agent-${AUTHPOISON_PROJECT}" >/dev/null 2>&1 || true
 "${PODMAN[@]}" volume rm -f "$AUTHPOISON_VOLUME" >/dev/null 2>&1 || true
+
+# --- 16. Claude token secret vs an existing container (exit 4) ------------
+# Uses SMOKE_LATE_SECRET, which starts absent, on its own scratch project.
+# (a) proxied create without the secret warns but succeeds; (b) once the
+# secret exists, reusing that container is refused (it can never gain an
+# env secret without being recreated); (b2) a container created with one
+# secret name and reused with another configured is refused, naming both
+# (a leftover smoke container must never run on a dummy token); (c) a container created WITH the
+# secret, stopped, then the secret deleted, is refused rather than left to
+# podman start's own cryptic "no such secret" error.
+SECRET_DIR="${WORKDIR}/secret-project"
+mkdir -p "$SECRET_DIR"
+run_enter_late() {
+  ENTER_EXIT=0
+  ENTER_OUT="$(ATELIER_CLAUDE_SECRET="$SMOKE_LATE_SECRET" "$ENTER" --project "$SECRET_PROJECT" --dir "$SECRET_DIR" --network proxied --no-tmux "$@" 2>&1)" || ENTER_EXIT=$?
+}
+
+run_enter_late -- true
+# Matched on text only the secret warning carries -- the empty-auth-volume
+# warning also mentions auth-login, and must not satisfy this on its own.
+if [[ "$ENTER_EXIT" -eq 0 && "$ENTER_OUT" == *"${SMOKE_LATE_SECRET} does not exist -- claude in"* ]]; then
+  pass "secret: a proxied create with no claude token secret warns (pointing at just auth-login claude) and still succeeds"
+else
+  fail "secret: a proxied create with no claude token secret warns and still succeeds (exit=${ENTER_EXIT}, got: ${ENTER_OUT})"
+fi
+
+printf '%s' "$SMOKE_CLAUDE_TOKEN" | "${PODMAN[@]}" secret create "$SMOKE_LATE_SECRET" - >/dev/null
+run_enter_late -- true
+if [[ "$ENTER_EXIT" -eq 4 && "$ENTER_OUT" == *"created without the Claude token secret ${SMOKE_LATE_SECRET}"* && "$ENTER_OUT" == *"--rebuild"* ]]; then
+  pass "secret: reusing a container created before the secret existed is refused (exit 4, names the secret, points at --rebuild)"
+else
+  fail "secret: reusing a container created before the secret existed is refused (exit 4) (got exit=${ENTER_EXIT}: ${ENTER_OUT})"
+fi
+
+"${PODMAN[@]}" rm -f "agent-${SECRET_PROJECT}" >/dev/null 2>&1 || true
+run_enter_late -- true
+if [[ "$ENTER_EXIT" -ne 0 ]]; then
+  fail "secret: a stopped container whose secret was deleted is refused (exit 4) (setup create failed: exit=${ENTER_EXIT}: ${ENTER_OUT})"
+else
+  ENTER_EXIT=0
+  ENTER_OUT="$(ATELIER_CLAUDE_SECRET="$SMOKE_CLAUDE_SECRET" "$ENTER" --project "$SECRET_PROJECT" --dir "$SECRET_DIR" --network proxied --no-tmux -- true 2>&1)" || ENTER_EXIT=$?
+  if [[ "$ENTER_EXIT" -eq 4 && "$ENTER_OUT" == *"$SMOKE_LATE_SECRET"* && "$ENTER_OUT" == *"$SMOKE_CLAUDE_SECRET"* ]]; then
+    pass "secret: reusing a container created with a different secret name than the configured one is refused (exit 4, names both)"
+  else
+    fail "secret: reusing a container created with a different secret name than the configured one is refused (exit 4, names both) (got exit=${ENTER_EXIT}: ${ENTER_OUT})"
+  fi
+  "${PODMAN[@]}" stop "agent-${SECRET_PROJECT}" >/dev/null
+  "${PODMAN[@]}" secret rm "$SMOKE_LATE_SECRET" >/dev/null
+  run_enter_late -- true
+  if [[ "$ENTER_EXIT" -eq 4 && "$ENTER_OUT" == *"$SMOKE_LATE_SECRET"* ]]; then
+    pass "secret: a stopped container whose secret was deleted is refused (exit 4, names the missing secret)"
+  else
+    fail "secret: a stopped container whose secret was deleted is refused (exit 4) (got exit=${ENTER_EXIT}: ${ENTER_OUT})"
+  fi
+fi
+"${PODMAN[@]}" rm -f "agent-${SECRET_PROJECT}" >/dev/null 2>&1 || true
 
 # --- Summary ------------------------------------------------------------
 echo

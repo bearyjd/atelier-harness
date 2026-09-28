@@ -51,6 +51,7 @@ inside a container anyway, mount it read-only.
 | Meute pins to | `agent-<project>:g<atelier-short-sha>`, plus the resulting `sha256:` digest asserted via `podman image inspect` before dispatch -- a rebuild that silently reused a tag fails loudly instead of running on an unreviewed image. |
 | Humans read | `agent-<project>:latest` (mutable, tracks the daily driver) and `:<YYYYMMDD>` (by convention immutable) |
 | Auth volumes | Five named volumes, never `$HOME` bind mounts (see below): `atelier-auth-claude`, `atelier-auth-codex` (both read-write, either consumer); `atelier-auth-gh` (the owner's interactive `hosts.yml`, mounted **only** by `agent-enter.sh` -- an unattended process must never see it, since it can push to every repo the owner can write to); `atelier-auth-gh-publish` and `atelier-auth-gh-review`, reserved for owner-minted fine-grained GitHub PATs that Meute populates and mounts read-only (scopes: AUDIT.md §4.1 -- `contents:write`/`pull_requests:write` on fleet repos only for `-publish`; `contents:read` + `pull_requests:write` for comments + `checks:read` for `-review`) |
+| Claude token secret | Podman secret `atelier-claude-token` (exact name), holding a long-lived `claude setup-token` subscription token. Consumed on `proxied` runs only, as `--secret atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN` (never on `none`, which never calls a model). Populated by `just auth-login claude`. Rotation: `just auth-login claude` again (`secret create --replace`), then restart the consuming containers -- the value is resolved at container start, so no recreate is needed. Takes precedence over whatever `.credentials.json` `atelier-auth-claude` still holds (AUDIT.md §4.1). |
 | Network profiles | `none` (`--network=none`; for runs that never call a model at all -- an in-container auth preflight, a local build/test step) and `proxied` (joins the `atelier-internal` network behind the `atelier-egress` proxy; **every Meute engine run is `proxied`**, since every engine run is a `claude -p` or `codex exec` call). `atelier-internal` is created with `--disable-dns` (deterministic `/etc/resolv.conf`, see below), so the proxied profile also adds `--add-host atelier-egress:<ip>` -- the name is no longer resolvable by DNS on that network at all. |
 | Proxy value | All four of `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` set to `http://atelier-egress:3128`, plus `NO_PROXY`/`no_proxy=localhost,127.0.0.1`. curl ignores uppercase `HTTP_PROXY` by design (CGI safety) and honours `HTTPS_PROXY`; plain-http fetches such as a git http remote or an npm mirror need the lowercase `http_proxy`, otherwise they fail closed with curl rc=6 rather than bypassing the allow-list. Measured by Meute on `agent-base:g691e067` with curl 8.18.0. Only how the `atelier-egress` name resolves changed, from DNS to the static `--add-host` entry above |
 | Volume labels | Credential volumes (`atelier-auth-*`) mount `:z` (shared label, no MCS categories) -- they are read by both `agent-enter.sh` and Meute's containers by design, and `:Z` on a named volume is per-container, not per-mount-site: whichever consumer mounts it `:Z` first rewrites its content to a category tied to that one container, and the other then gets `Permission denied` on an unflagged mount (reproduced 2026-09-23; see "Entering a project" below). Per-run bind mounts such as `/work` stay `:Z` (private label) -- only the one container that created them ever needs to read them. |
@@ -202,39 +203,78 @@ set that up for you.
 ## Populating auth volumes
 
 ```sh
-just auth
+just auth-login claude                     # Podman secret atelier-claude-token
+just auth-login codex                      # device-code login into atelier-auth-codex
+just auth-login gh atelier-auth-gh         # PAT on stdin; also -publish / -review
+just auth                                  # gh only: copy ~/.config/gh/hosts.yml into atelier-auth-gh
 ```
 
-`just auth` populates only the original three volumes --
-`atelier-auth-claude`, `atelier-auth-codex`, `atelier-auth-gh` -- by
-copying `~/.claude/.credentials.json`, `~/.codex/auth.json`, and
-`~/.config/gh/hosts.yml`, owned by uid 1000 and readable under the real
-`--userns=keep-id:uid=1000,gid=1000` flag set. The import logic lives in
-`scripts/auth-import.sh <volume> <file>`, which streams the credential
-file into a container using those exact flags rather than `podman volume
-import`, whose extraction runs in a different user-namespace mapping and
-produced files the agent user couldn't read. That extraction container
-also always runs with `--network=none`: it only ever needs to write the
-incoming tar stream to a volume, and the image it runs
-(`$ATELIER_AUTH_IMAGE`, overridable -- `tests/smoke.sh` points it at a
-throwaway image) has no legitimate reason to reach the network while a
+**Claude and Codex are logged in, never copied.** A copied OAuth
+credential is revoked the moment the host refreshes its own copy (AUDIT.md
+§4.1 "Trigger met": Meute got `401 OAuth access token has been revoked`
+that way), so `just auth` no longer touches them. `scripts/auth-login.sh`
+does, one tool per call:
+
+- `claude` -- run `claude setup-token` **on the host** in another terminal
+  (its browser sign-in needs hosts the egress allow-list deliberately
+  omits), then paste the printed token at the hidden prompt (or pipe it on
+  stdin). It is stored as the Podman secret `atelier-claude-token` via
+  stdin only -- never argv or env of any command -- and `agent-enter.sh`
+  injects it as `CLAUDE_CODE_OAUTH_TOKEN` on proxied runs. No refresh ever
+  happens inside a container, so the revocation cannot recur. Validation
+  is only "non-empty, no whitespace"; no token prefix is assumed.
+- `codex` -- runs `codex login --device-auth` in a hardened, `--read-only`
+  container on the proxied network with `atelier-auth-codex` mounted, so
+  that volume gets its own refresh pair. Needs `just egress-up`. If
+  ChatGPT refuses the device code, enable device-code login in ChatGPT's
+  security settings. The volume is not recreated (it holds config and
+  sessions too), and `codex logout` is never run: it could revoke a
+  refresh token still shared with the host.
+- `gh <volume>` -- `<volume>` must be exactly `atelier-auth-gh`,
+  `atelier-auth-gh-publish`, or `atelier-auth-gh-review`. Reads a PAT
+  (hidden prompt or stdin) and pipes it to `gh auth login --with-token`
+  through the proxy into a **staging** volume, then runs `gh auth
+  status` there. Only if both succeed is the target volume recreated (so
+  `hosts.yml` never mixes identities) and the staged login copied in by a
+  `--network=none` hardened container; the staging volume is removed on
+  success and on every failure, so a bad PAT never destroys the working
+  credential. Needs `just egress-up`, and refuses while any container
+  (even a stopped one) still references the volume, naming them.
+
+The codex and gh containers always run `agent-base:latest`;
+`$ATELIER_AUTH_IMAGE` is deliberately ignored here, since those
+containers are networked and the gh one holds a PAT. Every podman call
+fed a credential on stdin keeps its stdout off the terminal (`| cat` or
+`>/dev/null`): inside the `dev` distrobox, `distrobox-host-exec`
+allocates a pty whenever stdout is a TTY, which echoes piped stdin in
+cleartext and never delivers EOF.
+
+**Existing proxied containers need one `--rebuild` after the first
+`just auth-login claude`.** A secret can only be attached at creation, so
+`agent-enter.sh` refuses (exit 4) to reuse a proxied container created
+before the secret existed, rather than leave it silently unauthenticated.
+That `--rebuild` removes the container, so it also ends any tmux session
+running in it -- detach and save work first.
+
+`just auth` copies `~/.config/gh/hosts.yml` into `atelier-auth-gh` (gh's
+tokens do not rotate, so a copy is safe), owned by uid 1000 and readable
+under the real `--userns=keep-id:uid=1000,gid=1000` flag set. The import
+logic lives in `scripts/auth-import.sh <volume> <file>`, which streams the
+credential file into a container using those exact flags rather than
+`podman volume import`, whose extraction runs in a different
+user-namespace mapping and produced files the agent user couldn't read.
+That extraction container also always runs with `--network=none`: it only
+ever needs to write the incoming tar stream to a volume, and the image it
+runs (`$ATELIER_AUTH_IMAGE`, overridable -- `tests/smoke.sh` points it at
+a throwaway image) has no legitimate reason to reach the network while a
 credential is passing through it. Each run replaces a volume's contents
 rather than adding to them, so a rotated token doesn't leave the old one
-behind. This is a one-time (or re-run-when-rotated) step; it does not
-bind mount `$HOME`.
-
-`scripts/auth-import.sh` itself is generic -- it takes any volume name
-and any source file, so it's also what populates
-`atelier-auth-gh-publish` and `atelier-auth-gh-review` (see the Meute
-contract table above) once the owner has minted the corresponding
-fine-grained PAT. `just auth` intentionally does not do that step: those
-two tokens are Meute's to request and rotate, not something copied
-automatically off the owner's interactive session the way the other three
-are.
+behind. It does not bind mount `$HOME`. `scripts/auth-import.sh` itself
+is generic -- any volume name, any source file.
 
 **A populated auth volume shadows whatever the image put at that path.**
 Podman only copies an image's own content into a named volume when the
-volume is empty; once `just auth` has run, anything `agent-base` wrote
+volume is empty; once a login or import has written to it, anything `agent-base` wrote
 under e.g. `/home/agent/.claude` at build time is permanently hidden, with
 no warning. This is intentional -- the volume is the source of truth for
 credentials and settings -- but worth knowing before chasing a "my
@@ -288,8 +328,8 @@ Two network profiles, selected with `--network` (default `proxied`):
 
 | Profile | Effect |
 |---|---|
-| `proxied` | Joins `atelier-internal`; adds `--add-host atelier-egress:<ip>` (the network is DNS-disabled -- see "Running the egress proxy" -- so this is how the name resolves, read fresh from the running proxy container each time, not a second copy of its pinned IP); sets `HTTPS_PROXY`/`HTTP_PROXY` (and lowercase) to `http://atelier-egress:3128`, `NO_PROXY=localhost,127.0.0.1`. Fails fast with a `just egress-up` pointer if `atelier-egress` isn't running -- checked before every proxied create *and* every proxied reuse or attach, not only at creation, so it never silently falls back to no egress control. |
-| `none` | `--network=none`; no proxy env is injected. |
+| `proxied` | Joins `atelier-internal`; adds `--add-host atelier-egress:<ip>` (the network is DNS-disabled -- see "Running the egress proxy" -- so this is how the name resolves, read fresh from the running proxy container each time, not a second copy of its pinned IP); sets `HTTPS_PROXY`/`HTTP_PROXY` (and lowercase) to `http://atelier-egress:3128`, `NO_PROXY=localhost,127.0.0.1`; adds `--secret atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN` when that secret exists (a warning pointing at `just auth-login claude` otherwise, and the container is still created). Fails fast with a `just egress-up` pointer if `atelier-egress` isn't running -- checked before every proxied create *and* every proxied reuse or attach, not only at creation, so it never silently falls back to no egress control. |
+| `none` | `--network=none`; no proxy env and no Claude token secret is injected. |
 
 Before attaching -- on every invocation, including reattaching to an
 already-running container, not only at creation -- the image's
@@ -312,7 +352,12 @@ network profile are checked against what was just asked for. A different
 the container was created, is refused with a message pointing at
 `--rebuild` or a different `--project` -- not silently kept as the first
 directory, and not a per-invocation switch that only takes effect at
-creation.
+creation. The same applies to the Claude token secret on a proxied
+container: one created before `atelier-claude-token` existed is refused
+once it does (a secret can only be attached at creation), and a stopped
+one whose secret has since been deleted is refused instead of failing in
+`podman start` with a bare "no such secret". Rotating the token needs no
+recreate -- the value is resolved at container start.
 
 **This repository refuses itself as `--dir`, by filesystem identity, not
 by string.** This host has more than one canonical path to the same
@@ -387,7 +432,17 @@ resolves into `@earendil-works/pi-coding-agent` rather than a same-named
 bin from another package. It exercises `scripts/auth-import.sh` twice in
 a row against the same throwaway volume with two distinct probe files
 and asserts only the second remains (proving rotation replaces rather
-than accumulates), that only the three expected auth-volume paths ever
+than accumulates); it exercises `scripts/auth-login.sh` with a dummy
+token and a throwaway secret name (`ATELIER_CLAUDE_SECRET`) -- stored
+byte-exact with the trailing newline stripped, measured inside a
+container, never echoed, replaced by a second run, and left unchanged by
+an empty or whitespace-containing token -- plus its exit-2 refusals of an
+unknown tool, a non-allowed gh volume and gh with no volume, and the
+codex exit-1 refusal when the egress proxy is missing (via
+`ATELIER_EGRESS_HOST` pointed at a nonexistent name; real claude/codex/gh
+logins cannot run headless and are not faked); that `auth-import.sh` and
+`auth-login.sh claude`, run under a real pty with a canary on stdin,
+neither echo it nor hang; and that only the three expected auth-volume paths ever
 appear mounted under `$HOME`, that `atelier-egress`'s entrypoint rejects
 an IPv4-literal allow-list entry (e.g. the Podman gateway) with a clear
 error, and that `--network=none` blocks both DNS and a raw-IP connection.
@@ -428,7 +483,13 @@ never mutated), that `--rebuild` produces a new container id, that a
 stopped container is restarted rather than recreated
 (`start_if_stopped`), and that a dead proxy name is reported without ever
 touching the real `atelier-egress` (via `ATELIER_EGRESS_HOST` pointed at
-a name that does not exist).
+a name that does not exist). With a throwaway `ATELIER_CLAUDE_SECRET`
+exported for the whole run, it also asserts the proxied container sees
+`CLAUDE_CODE_OAUTH_TOKEN` byte-exact through `agent-enter.sh`'s own exec
+path, that `podman inspect` never contains the value, that a `none`
+container never gets it, and the three exit-4 secret refusals on reuse
+(created before the secret existed, created with a different secret
+name, stopped with its secret deleted).
 
 **Self-refusal is checked by filesystem identity, not by string**: via
 this repository's alternate canonical path on this host, via a symlinked

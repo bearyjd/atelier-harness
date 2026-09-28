@@ -73,6 +73,14 @@ fi
 # poisons it for the other -- reproduced 2026-09-23. :z resets the volume
 # to the shared container_file_t:s0 label on every import, so an import
 # never leaves private categories behind for whoever reads it next.
+#
+# The trailing `| cat` is load-bearing, not cosmetic: stdout of a
+# stdin-fed podman call must NEVER be a TTY. Inside the `dev` distrobox,
+# distrobox-host-exec runs host-spawn WITH a pty whenever its stdout is a
+# TTY (--no-pty only for `[ ! -t 1 ]`); the credential tar piped on stdin
+# is then echoed to the terminal in cleartext and EOF never reaches the
+# container, so the import hangs. Reproduced 2026-09-27 (review canary);
+# tests/smoke.sh section 4d runs this script under a real pty to guard it.
 tar -cf - -C "$(dirname "$src")" "$(basename "$src")" \
   | "${PODMAN[@]}" run --rm -i \
       --network=none \
@@ -81,6 +89,7 @@ tar -cf - -C "$(dirname "$src")" "$(basename "$src")" \
       --security-opt=no-new-privileges \
       -v "${volume}:/dest:z" \
       "$IMAGE" \
-      tar -xf - -C /dest
+      tar -xf - -C /dest \
+  | cat
 
 echo "auth-import: imported $(basename "$src") into volume ${volume}"

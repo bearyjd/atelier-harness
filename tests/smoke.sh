@@ -55,7 +55,13 @@ fail() { printf 'FAIL: %s\n' "$1"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 skip() { printf 'SKIP: %s -- %s\n' "$1" "$2"; SKIP_COUNT=$((SKIP_COUNT + 1)); }
 
 WORKDIR="$(mktemp -d)"
-cleanup() { rm -rf "$WORKDIR"; }
+# Throwaway Podman secret name for section 4c, passed to auth-login.sh via
+# its ATELIER_CLAUDE_SECRET override -- never the real atelier-claude-token.
+SMOKE_CLAUDE_SECRET="atelier-claude-token-smoke-$$"
+cleanup() {
+  "${PODMAN[@]}" secret rm "$SMOKE_CLAUDE_SECRET" >/dev/null 2>&1 || true
+  rm -rf "$WORKDIR"
+}
 trap cleanup EXIT
 
 BASE_FLAGS=(
@@ -423,6 +429,155 @@ if [[ "$POISON_OK" -eq 1 ]]; then
   pass "scripts/auth-import.sh: a volume previously :Z-poisoned by another container is still readable with a bare mount after re-import (:z resets the label)"
 else
   fail "scripts/auth-import.sh: a volume previously :Z-poisoned by another container is still readable with a bare mount after re-import (got: ${POISON_READ_OUT:-<import failed>})"
+fi
+
+# --- 4c. auth-login.sh: argument refusal and the claude secret path ------
+# The real logins (claude setup-token in a browser, codex device-code, a
+# real gh PAT) cannot be exercised headless and are deliberately NOT faked
+# here. What can be: the refusal paths (exit 2 before anything is
+# touched), and the whole claude path, since that is only "read a token
+# from stdin and store it as a Podman secret" -- a dummy value is exactly
+# as good as a real one for proving the plumbing. Throwaway secret name
+# only (SMOKE_CLAUDE_SECRET, removed in cleanup); no allowed gh volume
+# name is ever passed, because those are real, populated volumes on this
+# host and the gh path recreates its volume.
+AUTH_LOGIN="${REPO_ROOT}/scripts/auth-login.sh"
+
+# Runs auth-login.sh with the given stdin payload, capturing combined
+# output and the real exit code without tripping `set -e`.
+run_auth_login() {
+  local payload="$1"; shift
+  AL_EXIT=0
+  AL_OUT="$(printf '%s' "$payload" | ATELIER_PODMAN="${PODMAN[*]}" ATELIER_CLAUDE_SECRET="$SMOKE_CLAUDE_SECRET" "$AUTH_LOGIN" "$@" 2>&1)" || AL_EXIT=$?
+}
+
+# Length AND value, both measured INSIDE the container: `$(...)` on the
+# host strips trailing newlines, so a host-side string compare would pass
+# even if the stored token still carried the "\n" it was piped in with.
+secret_as_env() {
+  "${PODMAN[@]}" run --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+    --secret "${SMOKE_CLAUDE_SECRET},type=env,target=SMOKE_TOKEN" \
+    "${IMAGE}" bash -c 'printf "%s:%s" "${#SMOKE_TOKEN}" "$SMOKE_TOKEN"' 2>&1
+}
+
+run_auth_login "" definitely-not-a-tool
+if [[ "$AL_EXIT" -eq 2 ]]; then
+  pass "auth-login.sh: an unknown tool is refused with usage (exit 2)"
+else
+  fail "auth-login.sh: an unknown tool is refused with usage (exit 2) (got exit=${AL_EXIT}: ${AL_OUT})"
+fi
+
+run_auth_login "" gh "atelier-smoke-not-a-gh-volume-$$"
+if [[ "$AL_EXIT" -eq 2 ]] && ! "${PODMAN[@]}" volume exists "atelier-smoke-not-a-gh-volume-$$" 2>/dev/null; then
+  pass "auth-login.sh: gh with a volume outside the three allowed names is refused (exit 2), nothing created"
+else
+  fail "auth-login.sh: gh with a volume outside the three allowed names is refused (exit 2) (got exit=${AL_EXIT}: ${AL_OUT})"
+  "${PODMAN[@]}" volume rm -f "atelier-smoke-not-a-gh-volume-$$" >/dev/null 2>&1 || true
+fi
+
+run_auth_login "" gh
+if [[ "$AL_EXIT" -eq 2 ]]; then
+  pass "auth-login.sh: gh with no volume is refused with usage (exit 2)"
+else
+  fail "auth-login.sh: gh with no volume is refused with usage (exit 2) (got exit=${AL_EXIT}: ${AL_OUT})"
+fi
+
+# Proxy preflight, exercised without touching the real atelier-egress:
+# ATELIER_EGRESS_HOST (the same override agent-enter.sh honours) points
+# at a name that does not exist, so only a read-only `podman inspect` of
+# that missing name ever runs.
+AL_EXIT=0
+AL_OUT="$(ATELIER_PODMAN="${PODMAN[*]}" ATELIER_EGRESS_HOST="atelier-egress-does-not-exist-$$" "$AUTH_LOGIN" codex </dev/null 2>&1)" || AL_EXIT=$?
+if [[ "$AL_EXIT" -eq 1 && "$AL_OUT" == *"just egress-up"* ]]; then
+  pass "auth-login.sh codex: a missing egress proxy fails fast (exit 1) with the just egress-up pointer"
+else
+  fail "auth-login.sh codex: a missing egress proxy fails fast (exit 1) with the just egress-up pointer (got exit=${AL_EXIT}: ${AL_OUT})"
+fi
+
+TOKEN_A="smoke-token-a-$$"
+TOKEN_B="smoke-token-b-$$"
+run_auth_login "${TOKEN_A}"$'\n' claude
+SECRET_READ="$(secret_as_env)" || SECRET_READ="<podman run failed: ${SECRET_READ}>"
+if [[ "$AL_EXIT" -eq 0 && "$SECRET_READ" == "${#TOKEN_A}:${TOKEN_A}" && "$AL_OUT" != *"$TOKEN_A"* ]]; then
+  pass "auth-login.sh claude: a token piped with a trailing newline is stored byte-exact (length ${#TOKEN_A}, newline stripped) and never echoed"
+else
+  fail "auth-login.sh claude: a token piped with a trailing newline is stored byte-exact and never echoed (exit=${AL_EXIT}, in-container len:value=${SECRET_READ}, output: ${AL_OUT})"
+fi
+
+run_auth_login "${TOKEN_B}"$'\n' claude
+SECRET_READ="$(secret_as_env)" || SECRET_READ="<podman run failed: ${SECRET_READ}>"
+if [[ "$AL_EXIT" -eq 0 && "$SECRET_READ" == "${#TOKEN_B}:${TOKEN_B}" ]]; then
+  pass "auth-login.sh claude: a second run replaces the secret (--replace; the second value wins)"
+else
+  fail "auth-login.sh claude: a second run replaces the secret (exit=${AL_EXIT}, in-container len:value=${SECRET_READ}, output: ${AL_OUT})"
+fi
+
+run_auth_login $'\n' claude
+EMPTY_EXIT="$AL_EXIT"
+run_auth_login "smoke token-with-space"$'\n' claude
+SPACE_EXIT="$AL_EXIT"
+SECRET_READ="$(secret_as_env)" || SECRET_READ="<podman run failed: ${SECRET_READ}>"
+if [[ "$EMPTY_EXIT" -ne 0 && "$SPACE_EXIT" -ne 0 && "$SECRET_READ" == "${#TOKEN_B}:${TOKEN_B}" ]]; then
+  pass "auth-login.sh claude: an empty token and a token containing whitespace are both refused, and the stored secret is unchanged"
+else
+  fail "auth-login.sh claude: an empty token and a token containing whitespace are both refused, secret unchanged (empty exit=${EMPTY_EXIT}, space exit=${SPACE_EXIT}, in-container len:value=${SECRET_READ})"
+fi
+
+# --- 4d. Stdin-fed podman calls under a real PTY: no echo, no hang -------
+# Found in review 2026-09-27: inside the `dev` distrobox,
+# distrobox-host-exec runs host-spawn WITH a pty whenever its stdout is a
+# TTY (it only passes --no-pty for `[ ! -t 1 ]`). A credential piped on
+# stdin is then echoed to the terminal in cleartext, and EOF never
+# reaches the container, so the call hangs. Canary evidence:
+# `printf GHCANARY | distrobox-host-exec sh -c 'wc -c'` under a pty
+# printed GHCANARY and hung. `script` gives each call a real pty for
+# stdout (stdin stays the pipe, exactly the owner's `just auth` case);
+# `timeout` turns a hang into exit 124 instead of a stuck suite. Outside
+# a distrobox there is no host-exec hop and this passes trivially.
+PTY_CANARY="PTYCANARY$$"
+PTY_VOLUME="atelier-smoke-pty-probe-$$"
+PTY_FILE="${WORKDIR}/pty-canary.json"
+printf '{"canary":"%s"}' "$PTY_CANARY" > "$PTY_FILE"
+chmod 600 "$PTY_FILE"
+
+# Runs a shell command line under a pty with a 60s ceiling; sets PTY_EXIT
+# and PTY_OUT (everything the pty displayed).
+run_under_pty() {
+  PTY_EXIT=0
+  PTY_OUT="$(timeout 60 script -qefc "$1" /dev/null </dev/null 2>&1)" || PTY_EXIT=$?
+}
+
+run_under_pty "ATELIER_PODMAN='${PODMAN[*]}' '${REPO_ROOT}/scripts/auth-import.sh' '${PTY_VOLUME}' '${PTY_FILE}'"
+"${PODMAN[@]}" volume rm -f "$PTY_VOLUME" >/dev/null 2>&1 || true
+if [[ "$PTY_EXIT" -eq 0 && "$PTY_OUT" != *"$PTY_CANARY"* ]]; then
+  pass "auth-import.sh under a pty: the piped credential is not echoed and the call does not hang"
+else
+  fail "auth-import.sh under a pty: the piped credential is not echoed and the call does not hang (exit=${PTY_EXIT}$([[ "$PTY_EXIT" -eq 124 ]] && echo ' = TIMED OUT'), canary echoed: $([[ "$PTY_OUT" == *"$PTY_CANARY"* ]] && echo yes || echo no))"
+fi
+
+run_under_pty "printf '%s\n' '${PTY_CANARY}' | ATELIER_PODMAN='${PODMAN[*]}' ATELIER_CLAUDE_SECRET='${SMOKE_CLAUDE_SECRET}' '${AUTH_LOGIN}' claude"
+if [[ "$PTY_EXIT" -eq 0 && "$PTY_OUT" != *"$PTY_CANARY"* ]]; then
+  pass "auth-login.sh claude under a pty: the piped token is not echoed and the call does not hang"
+else
+  fail "auth-login.sh claude under a pty: the piped token is not echoed and the call does not hang (exit=${PTY_EXIT}$([[ "$PTY_EXIT" -eq 124 ]] && echo ' = TIMED OUT'), canary echoed: $([[ "$PTY_OUT" == *"$PTY_CANARY"* ]] && echo yes || echo no))"
+fi
+
+# The same pty mode also SWALLOWS piped stdin in any podman call that
+# merely inherits it with a TTY stdout -- found while verifying the fix
+# above: gh's preflight `podman network exists` ate and echoed the PAT
+# before auth-login.sh ever read it. Exercised up to exactly that call:
+# ATELIER_EGRESS_NET names a network that does not exist, so after a
+# read-only inspect of the running proxy the script exits 1 at `network
+# exists`, before reading the PAT or touching any volume.
+if [[ "$("${PODMAN[@]}" inspect "${EGRESS_HOST}" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]]; then
+  run_under_pty "printf '%s\n' '${PTY_CANARY}' | ATELIER_PODMAN='${PODMAN[*]}' ATELIER_EGRESS_NET='atelier-net-does-not-exist-$$' '${AUTH_LOGIN}' gh atelier-auth-gh-review"
+  if [[ "$PTY_EXIT" -eq 1 && "$PTY_OUT" == *"does not exist"* && "$PTY_OUT" != *"$PTY_CANARY"* ]]; then
+    pass "auth-login.sh gh under a pty: preflight podman calls do not swallow or echo the piped PAT"
+  else
+    fail "auth-login.sh gh under a pty: preflight podman calls do not swallow or echo the piped PAT (exit=${PTY_EXIT}, canary echoed: $([[ "$PTY_OUT" == *"$PTY_CANARY"* ]] && echo yes || echo no))"
+  fi
+else
+  fail "auth-login.sh gh under a pty: needs ${EGRESS_HOST} running (read-only inspect only); run 'just egress-up'"
 fi
 
 # --- 5. Only the three expected paths are mounted under $HOME -----------

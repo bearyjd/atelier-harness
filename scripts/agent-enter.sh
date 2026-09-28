@@ -47,6 +47,14 @@
 #     change what "exactly /work plus the three auth volumes" looks like
 #     to anything inspecting .Mounts (tests/smoke-enter.sh included).
 #
+# CLAUDE TOKEN SECRET (AUDIT.md §4.1, added 2026-09-27): besides the
+# mounts above, a proxied container also gets one Podman secret as an env
+# var -- `--secret atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN`
+# -- when that secret exists (populated by `just auth-login claude`). It is
+# not a mount, so .Mounts is still exactly /work plus the three auth
+# volumes, and the value never appears in `podman inspect` (verified).
+# See add_claude_secret_flag / check_container_secret below.
+#
 # Functions are kept under 50 lines each; no `|| true` hides a real
 # failure anywhere in this file.
 set -euo pipefail
@@ -65,6 +73,10 @@ EGRESS_PORT="${ATELIER_EGRESS_PORT:-3128}"
 AUTH_VOLUME_CLAUDE="${ATELIER_AUTH_VOLUME_CLAUDE:-atelier-auth-claude}"
 AUTH_VOLUME_CODEX="${ATELIER_AUTH_VOLUME_CODEX:-atelier-auth-codex}"
 AUTH_VOLUME_GH="${ATELIER_AUTH_VOLUME_GH:-atelier-auth-gh}"
+# Default name is part of the Meute contract (README.md); the override
+# exists so tests/smoke-enter.sh never injects the owner's real token.
+CLAUDE_SECRET="${ATELIER_CLAUDE_SECRET:-atelier-claude-token}"
+CLAUDE_TOKEN_ENV="CLAUDE_CODE_OAUTH_TOKEN"
 
 # H5: fail loudly, naming the resolved root, rather than crash later with a
 # bare "No such file or directory" from a relative path that silently
@@ -363,7 +375,13 @@ ensure_auth_volume() {
     contents="$(probe_volume_contents "$vol")"
   fi
   if [[ -z "$contents" ]]; then
-    echo "agent-enter: warning: auth volume ${vol} is empty -- 'just auth' has not populated it yet" >&2
+    if [[ "$vol" == "$AUTH_VOLUME_CLAUDE" ]]; then
+      # Not a problem on its own: claude authenticates from the token
+      # secret (CLAUDE_CODE_OAUTH_TOKEN), not from this volume.
+      echo "agent-enter: note: auth volume ${vol} is empty -- that is normal, claude authenticates via its token secret (just auth-login claude)" >&2
+    else
+      echo "agent-enter: warning: auth volume ${vol} is empty -- nothing has populated it yet (see README.md 'Populating auth volumes': just auth-login codex|gh, or just auth for gh)" >&2
+    fi
   fi
 }
 
@@ -426,6 +444,7 @@ build_run_flags() {
   )
   if [[ "$NETWORK" == "proxied" ]]; then
     add_proxy_flags
+    add_claude_secret_flag
   else
     RUN_FLAGS+=(--network=none)
   fi
@@ -465,6 +484,88 @@ add_proxy_flags() {
   )
 }
 
+# --- Claude token secret (AUDIT.md §4.1) ------------------------------------
+# Proxied only: the `none` profile never calls a model, so it never gets
+# the token. A missing secret is a warning, not a refusal -- codex and pi
+# may still be usable in the container without it. The value travels
+# only as a secret reference; it is never in argv, `-e`, or `inspect`.
+warn_no_claude_secret() {
+  echo "agent-enter: warning: Podman secret ${CLAUDE_SECRET} does not exist -- claude in ${CONTAINER} will not be authenticated (codex/pi may still work); run: just auth-login claude" >&2
+}
+
+add_claude_secret_flag() {
+  if "${PODMAN[@]}" secret exists "$CLAUDE_SECRET" 2>/dev/null; then
+    RUN_FLAGS+=(--secret "${CLAUDE_SECRET},type=env,target=${CLAUDE_TOKEN_ENV}")
+  else
+    warn_no_claude_secret
+  fi
+}
+
+# Which secret (if any) the container was created with, by name. Found
+# empirically on podman 5.8.7 (2026-09-27): a `type=env` secret does NOT
+# appear in `.Config.Secrets` (null -- only mount-type secrets are listed
+# there) nor anywhere under `.HostConfig`; the only inspect field that
+# records it is `.Config.CreateCommand`, the argv the container was
+# created with. Sets REFERENCED_SECRET (empty if there is no reference).
+#
+# Sets a global rather than printing for `$(...)`, and captures inspect
+# into a variable before parsing (here-string, not `< <(...)`): a failure
+# inside a process substitution -- or inside a command substitution's
+# subshell, which does not inherit errexit here (see
+# sanitize_project_name) -- would be silently ignored and read as "no
+# secret". Here a failed inspect stops the script under `set -e`.
+container_claude_secret() {
+  local create_cmd arg
+  REFERENCED_SECRET=""
+  create_cmd="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{range .Config.CreateCommand}}{{println .}}{{end}}')"
+  while IFS= read -r arg; do
+    if [[ "$arg" == *",type=env,target=${CLAUDE_TOKEN_ENV}" ]]; then
+      REFERENCED_SECRET="${arg%%,*}"
+      return 0
+    fi
+  done <<< "$create_cmd"
+}
+
+# Reuse path. Rotation needs only a restart, never --rebuild: a --secret
+# env var is resolved at container START, not create (verified
+# 2026-09-27: `secret create --replace`, then stop+start, shows the new
+# value; so does `secret rm` + `secret create` under the same name). Two
+# states cannot be fixed by a restart, and both refuse with exit 4 in the
+# same spirit as check_container_matches_request:
+#   - created without the secret, which exists now: an env secret can only
+#     be attached at creation, so this container would silently stay
+#     unauthenticated forever.
+#   - created with a DIFFERENT secret name than the one now configured
+#     (e.g. a leftover smoke-test container carrying a dummy token):
+#     silently running on the wrong token is worse than refusing.
+#   - created with a secret that has since been deleted: `podman start`
+#     fails with a bare `no secret with name or id ...: no such secret`.
+#     Only checked when the container actually needs starting -- a running
+#     one already has the env var and keeps working.
+check_container_secret() {
+  [[ "$NETWORK" == "proxied" ]] || return 0
+  local referenced running
+  container_claude_secret
+  referenced="$REFERENCED_SECRET"
+  if [[ -z "$referenced" ]]; then
+    if "${PODMAN[@]}" secret exists "$CLAUDE_SECRET" 2>/dev/null; then
+      echo "agent-enter: container ${CONTAINER} was created without the Claude token secret ${CLAUDE_SECRET}, which exists now; a secret can only be attached at creation, so pass --rebuild to recreate it" >&2
+      exit 4
+    fi
+    warn_no_claude_secret
+    return 0
+  fi
+  if [[ "$referenced" != "$CLAUDE_SECRET" ]]; then
+    echo "agent-enter: container ${CONTAINER} was created with the Podman secret ${referenced}, but the configured Claude token secret is ${CLAUDE_SECRET}; pass --rebuild to recreate it with the configured one" >&2
+    exit 4
+  fi
+  running="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.State.Running}}')"
+  if [[ "$running" != "true" ]] && ! "${PODMAN[@]}" secret exists "$referenced" 2>/dev/null; then
+    echo "agent-enter: container ${CONTAINER} was created with the Podman secret ${referenced}, which no longer exists, so it cannot be started; recreate the secret (just auth-login claude) or pass --rebuild to recreate the container" >&2
+    exit 4
+  fi
+}
+
 # --- --rebuild (AUDIT.md §3.1) ----------------------------------------------
 do_rebuild() {
   echo "agent-enter: --rebuild requested: removing session/container and rebuilding ${IMAGE}" >&2
@@ -496,6 +597,7 @@ ensure_container() {
   if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null; then
     check_network_preflight
     check_container_matches_request
+    check_container_secret
     start_if_stopped
   else
     check_network_preflight
