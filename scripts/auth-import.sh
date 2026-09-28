@@ -65,13 +65,21 @@ fi
 # credential tar as it arrives on stdin and exfiltrate it over the
 # network while `tar -xf` is running; no network is ever a legitimate
 # requirement for this step (Codex LOW, 2026-09-22).
+#
+# :z (shared label), not unflagged: an unflagged mount only works while
+# nothing has ever :Z-mounted this volume. These volumes are read by both
+# agent-enter.sh (interactive) and Meute's unattended containers by
+# design, so whichever mounts first with :Z (a private MCS category)
+# poisons it for the other -- reproduced 2026-09-23. :z resets the volume
+# to the shared container_file_t:s0 label on every import, so an import
+# never leaves private categories behind for whoever reads it next.
 tar -cf - -C "$(dirname "$src")" "$(basename "$src")" \
   | "${PODMAN[@]}" run --rm -i \
       --network=none \
       --userns=keep-id:uid=1000,gid=1000 \
       --cap-drop=ALL \
       --security-opt=no-new-privileges \
-      -v "${volume}:/dest" \
+      -v "${volume}:/dest:z" \
       "$IMAGE" \
       tar -xf - -C /dest
 

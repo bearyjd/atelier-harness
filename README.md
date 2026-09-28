@@ -53,6 +53,7 @@ inside a container anyway, mount it read-only.
 | Auth volumes | Five named volumes, never `$HOME` bind mounts (see below): `atelier-auth-claude`, `atelier-auth-codex` (both read-write, either consumer); `atelier-auth-gh` (the owner's interactive `hosts.yml`, mounted **only** by `agent-enter.sh` -- an unattended process must never see it, since it can push to every repo the owner can write to); `atelier-auth-gh-publish` and `atelier-auth-gh-review`, reserved for owner-minted fine-grained GitHub PATs that Meute populates and mounts read-only (scopes: AUDIT.md §4.1 -- `contents:write`/`pull_requests:write` on fleet repos only for `-publish`; `contents:read` + `pull_requests:write` for comments + `checks:read` for `-review`) |
 | Network profiles | `none` (`--network=none`; for runs that never call a model at all -- an in-container auth preflight, a local build/test step) and `proxied` (joins the `atelier-internal` network behind the `atelier-egress` proxy; **every Meute engine run is `proxied`**, since every engine run is a `claude -p` or `codex exec` call). `atelier-internal` is created with `--disable-dns` (deterministic `/etc/resolv.conf`, see below), so the proxied profile also adds `--add-host atelier-egress:<ip>` -- the name is no longer resolvable by DNS on that network at all. |
 | Proxy value | All four of `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` set to `http://atelier-egress:3128`, plus `NO_PROXY`/`no_proxy=localhost,127.0.0.1`. curl ignores uppercase `HTTP_PROXY` by design (CGI safety) and honours `HTTPS_PROXY`; plain-http fetches such as a git http remote or an npm mirror need the lowercase `http_proxy`, otherwise they fail closed with curl rc=6 rather than bypassing the allow-list. Measured by Meute on `agent-base:g691e067` with curl 8.18.0. Only how the `atelier-egress` name resolves changed, from DNS to the static `--add-host` entry above |
+| Volume labels | Credential volumes (`atelier-auth-*`) mount `:z` (shared label, no MCS categories) -- they are read by both `agent-enter.sh` and Meute's containers by design, and `:Z` on a named volume is per-container, not per-mount-site: whichever consumer mounts it `:Z` first rewrites its content to a category tied to that one container, and the other then gets `Permission denied` on an unflagged mount (reproduced 2026-09-23; see "Entering a project" below). Per-run bind mounts such as `/work` stay `:Z` (private label) -- only the one container that created them ever needs to read them. |
 
 Registry: local-only for now (images are unqualified `agent-<project>`,
 resolved as `localhost/agent-<project>` by Podman). Nothing here embeds
@@ -353,6 +354,19 @@ repository's own tree -- its self-refusal content check uses a throwaway
 copy of the two marker files, specifically to avoid that (an earlier
 version of the suite did relabel this repo via its `--allow-self` case;
 fixed).
+
+**The three auth volumes are the one exception: they mount `:z`, not
+`:Z`.** Unlike the project directory, a credential volume is read by
+*more than one* consumer by design (`agent-enter.sh` interactively,
+Meute's containers unattended) -- `:Z`'s private category is per
+mounting-container, not per volume, so whichever consumer mounts it
+`:Z` first rewrites its content to a category tied to that one
+container, and the other then gets `Permission denied` on an unflagged
+mount (reproduced 2026-09-23 from a Meute report: exactly this happened
+once Meute's unattended runs started `:Z`-mounting the same volumes
+`agent-enter.sh` mounts with no flag at all). `:z` resets the volume to
+the shared `container_file_t:s0` label on every mount, which any later
+mount of the same volume can read regardless of what mounted it last.
 
 ## Smoke test
 

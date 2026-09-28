@@ -180,6 +180,20 @@ rather than accumulates, and exits non-zero if nothing was imported. The
 smoke test exercises the same script with a dummy file and a throwaway
 volume.
 
+**Volume labels (found by Meute 2026-09-22, reproduced here):** a
+credential volume mounted `:Z` takes the mounting container's private
+MCS categories, and the next container that mounts it without `:Z` is
+denied. Because these volumes are shared between interactive and
+unattended containers *by design*, each `:Z` use steals the label from
+the other, and the symptom is an intermittent "not logged in" in
+whichever container ran second, which looks exactly like the refresh
+race above. Rule: credential volumes mount `:z` (shared label, no
+categories); only per-run bind mounts such as `/work` take `:Z`. The
+privacy `:Z` would add to a credential volume is illusory, since reading
+one already requires mounting it by name. `agent-enter.sh` and
+`auth-import.sh` mount `:z`; the smoke tests poison a throwaway volume
+with `:Z` first and assert the read still succeeds.
+
 **Shadowing:** Podman copies image content into a volume only while the
 volume is empty. Once `atelier-auth-claude` is populated, anything the
 image placed under `CLAUDE_CONFIG_DIR` is hidden. This is intended: the
@@ -208,6 +222,26 @@ independent token. `just auth` copies today because it needs no
 interaction; a `just auth-login` recipe is the Phase 2 follow-up if
 Meute's test with an interactive session open shows invalidation. Nothing
 in the smoke test can cover this without real credentials.
+
+**Trigger met (Meute Phase 2b, 2026-09-23, confirmed on this host):** a
+container run returned `401 OAuth access token has been revoked`. The
+host had refreshed its own access token; `atelier-auth-claude` still
+held the pre-refresh copy, now revoked. Refresh is single-use in
+practice: refreshing one copy invalidates the other. Codex has the same
+shape and is unaffected only because its volume has not been refreshed
+out from under it yet. Conclusion: **`just auth` is wrong for Claude and
+Codex** and stays only for `gh`, whose tokens do not rotate.
+
+Design for `just auth-login`, from the CLIs' own options rather than
+assumption: `claude setup-token` issues a long-lived subscription token
+consumed via `CLAUDE_CODE_OAUTH_TOKEN`; stored as a Podman secret and
+injected as an environment variable at `podman run`, it removes refresh
+from the container side entirely, so the failure cannot recur rather
+than being made less likely. `codex login --device-auth` runs inside a
+container with the codex volume mounted, giving that volume its own
+refresh pair that is never duplicated. `gh auth login --with-token`
+takes a PAT on stdin into the gh volumes. Each is one bounded command
+with the owner at a browser for the Claude and Codex steps.
 
 **Ephemeral Meute containers** mount `atelier-auth-claude` and
 `atelier-auth-codex` read-write (both CLIs write to their dirs) and one of
@@ -351,8 +385,10 @@ process ever needs the tree back. Note `:Z` relabels the
 directory on the host; that is reversible (`restorecon -R`) and is the
 standard rootless-Podman practice on Fedora-family hosts.
 
-`:z` (shared label) is not used anywhere in this repo. The one place it
-appeared, the proxy's `resolv.conf` mount, was replaced by `--dns` flags.
+`:z` (shared label) is used for exactly one thing: the credential
+volumes, for the reason in §4.1. Every bind mount of a directory stays
+`:Z`. The proxy's former `resolv.conf` mount, once `:z`, was replaced by
+`--dns` flags.
 
 **Read-only rootfs: verified and kept (Phase 2).** Agent containers run
 `--read-only` with tmpfs at `/tmp`, `/home/agent/.cache`,

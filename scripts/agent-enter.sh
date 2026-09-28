@@ -369,10 +369,13 @@ ensure_auth_volume() {
 
 probe_volume_contents() {
   local vol="$1"
+  # :z for the same reason as the real mounts in build_run_flags (see
+  # its comment): this containerized read must not fail just because
+  # some other consumer previously :Z-poisoned the volume.
   "${PODMAN[@]}" run --rm \
     --network=none --cap-drop=ALL --security-opt=no-new-privileges \
     --read-only --userns=keep-id:uid=1000,gid=1000 \
-    -v "${vol}:/probe:ro" \
+    -v "${vol}:/probe:ro,z" \
     agent-base:latest bash -c 'ls -A /probe 2>/dev/null'
 }
 
@@ -383,6 +386,23 @@ ensure_auth_volumes() {
 }
 
 # --- podman run flags (AUDIT.md §4.3, plus the read-only experiment above) -
+# `/work` is `:Z` (private label): only this one container ever needs to
+# read it. The three auth volumes are `:z` (shared label), not `:Z` and
+# not unflagged -- found in testing (Meute report, reproduced here):
+# `:Z`-mounting a named volume rewrites its content to a PRIVATE MCS
+# category tied to that one container; a later container mounting the
+# same volume with no flag at all then gets Permission denied, because
+# SELinux enforces the mismatched category against a mount that never
+# asked for a relabel. These volumes are read by both `agent-enter.sh`
+# (interactive) and Meute's unattended containers by design -- that's the
+# whole point of a named credential volume instead of a bind mount -- so
+# whichever one mounts first with `:Z` poisons it for the other. `:z`
+# resets the volume to the shared `container_file_t:s0` label (no
+# categories) on every mount, which every later mount of the same volume
+# can read regardless of what mounted it last. The isolation `:Z` would
+# otherwise buy here is illusory anyway: reading a named volume already
+# requires knowing its name and mounting it explicitly, which is exactly
+# the access a shared label grants and nothing more.
 build_run_flags() {
   RUN_FLAGS=(
     -d
@@ -400,9 +420,9 @@ build_run_flags() {
     --tmpfs /home/agent/.npm
     --tmpfs /home/agent/.local/share
     --tmpfs /home/agent/.config
-    -v "${AUTH_VOLUME_CLAUDE}:/home/agent/.claude"
-    -v "${AUTH_VOLUME_CODEX}:/home/agent/.codex"
-    -v "${AUTH_VOLUME_GH}:/home/agent/.config/gh"
+    -v "${AUTH_VOLUME_CLAUDE}:/home/agent/.claude:z"
+    -v "${AUTH_VOLUME_CODEX}:/home/agent/.codex:z"
+    -v "${AUTH_VOLUME_GH}:/home/agent/.config/gh:z"
   )
   if [[ "$NETWORK" == "proxied" ]]; then
     add_proxy_flags

@@ -75,6 +75,8 @@ DOTTED_PROJECT="smoke.dot-$$"
 H6_PROJECT="smoke-h6-$$"
 STALE_PROJECT="smoke-stale-$$"
 PREFLIGHT_PROJECT="smoke-preflight-$$"
+AUTHPOISON_PROJECT="smoke-authpoison-$$"
+AUTHPOISON_VOLUME="atelier-smoke-authpoison-vol-$$"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -91,9 +93,10 @@ cleanup() {
   local p
   for p in "$TEST_PROJECT" "$MISMATCH_PROJECT" "$NONE_PROJECT" \
            "$DOTTED_PROJECT" "$H6_PROJECT" "$STALE_PROJECT" \
-           "$PREFLIGHT_PROJECT" "fake-checkout" "atelier-harness"; do
+           "$PREFLIGHT_PROJECT" "$AUTHPOISON_PROJECT" "fake-checkout" "atelier-harness"; do
     "${PODMAN[@]}" rm -f "agent-${p}" >/dev/null 2>&1 || true
   done
+  "${PODMAN[@]}" volume rm -f "$AUTHPOISON_VOLUME" >/dev/null 2>&1 || true
   # just build tags :latest AND :<YYYYMMDD> on every build (Justfile
   # build recipe) -- both must go, not just :latest, or the date tag
   # accumulates as a stray image across runs (found in testing: two
@@ -657,6 +660,34 @@ else
   fail "H6: setup could not remove the container to test recreation"
 fi
 "${PODMAN[@]}" rm -f "agent-${H6_PROJECT}" >/dev/null 2>&1 || true
+
+# --- 15. Auth-volume mount survives a prior :Z poisoning (Meute report) ---
+# Reproduced 2026-09-23: :Z-mounting a named volume rewrites its content to
+# a PRIVATE SELinux MCS category tied to that one container; a later
+# container mounting the same volume with no relabel flag at all then gets
+# Permission denied. build_run_flags used to mount the three auth volumes
+# with no flag, which only worked while nothing had ever :Z-mounted them --
+# Meute's unattended containers did exactly that. Uses a throwaway volume
+# via agent-enter.sh's own ATELIER_AUTH_VOLUME_CLAUDE override (never the
+# real atelier-auth-claude), so this proves the fix without touching real
+# credentials.
+AUTHPOISON_DIR="${WORKDIR}/authpoison-project"
+mkdir -p "$AUTHPOISON_DIR"
+"${PODMAN[@]}" volume create "$AUTHPOISON_VOLUME" >/dev/null
+"${PODMAN[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 \
+  -v "${AUTHPOISON_VOLUME}:/dest:Z" agent-base:latest bash -c 'echo poisoned > /dest/marker.txt' >/dev/null
+
+AUTHPOISON_OUT="$(ATELIER_AUTH_VOLUME_CLAUDE="$AUTHPOISON_VOLUME" "$ENTER" \
+  --project "$AUTHPOISON_PROJECT" --dir "$AUTHPOISON_DIR" --network none --no-tmux \
+  -- cat /home/agent/.claude/marker.txt 2>&1)" || AUTHPOISON_EXIT=$?
+if [[ "${AUTHPOISON_EXIT:-0}" -eq 0 && "$AUTHPOISON_OUT" == *poisoned* ]]; then
+  pass "the auth-volume mount survives a prior :Z poisoning of the volume by another container (:z, not unflagged)"
+else
+  fail "the auth-volume mount survives a prior :Z poisoning of the volume by another container (got exit=${AUTHPOISON_EXIT:-0}: ${AUTHPOISON_OUT})"
+fi
+unset AUTHPOISON_EXIT
+"${PODMAN[@]}" rm -f "agent-${AUTHPOISON_PROJECT}" >/dev/null 2>&1 || true
+"${PODMAN[@]}" volume rm -f "$AUTHPOISON_VOLUME" >/dev/null 2>&1 || true
 
 # --- Summary ------------------------------------------------------------
 echo

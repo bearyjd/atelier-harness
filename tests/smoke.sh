@@ -369,6 +369,62 @@ else
   fail "scripts/auth-import.sh: two sequential imports into the same volume leave only the second probe (got: ${AUTH_READ_OUT:-<import failed>})"
 fi
 
+# --- 4b. auth-import.sh survives a prior :Z poisoning of the volume ------
+# Meute report, reproduced 2026-09-23: mounting a named volume with :Z
+# (private label) rewrites its content to an MCS category tied to that
+# ONE container; a later container mounting the same volume with no flag
+# at all then gets Permission denied, because SELinux enforces the
+# mismatched category against a mount that never asked for a relabel.
+# These credential volumes are read by both agent-enter.sh (interactive)
+# and Meute's unattended containers by design, so whichever mounts first
+# with :Z poisons it for the other. auth-import.sh's own /dest mount is
+# now :z (shared label, no categories) for the same stated reason and for
+# consistency with the auth-volume mounts elsewhere in this repo.
+#
+# CAVEAT, found while verifying this: this specific end-to-end sequence
+# (import, poison, RE-IMPORT, read unflagged) passes identically whether
+# /dest is :z or unflagged, and therefore does not by itself distinguish
+# the fix. Root cause: auth-import.sh always does `volume rm` + `volume
+# create` before every import (never an in-place write), and a freshly
+# created volume already starts at the default container_file_t:s0 label
+# with no categories -- verified directly: `podman volume rm && podman
+# volume create` on the same name resets an already-:Z-poisoned
+# directory's label to category-less BEFORE any new mount ever touches
+# it. So the re-import step here erases the poisoning on its own,
+# regardless of which flag /dest carries. The :z change is kept anyway
+# (harmless, matches the stated design intent, and is the more robust
+# choice if that recreate-every-call behavior is ever relaxed), but this
+# assertion is a genuine regression guard for the rotation-after-
+# poisoning workflow, not proof that the flag change itself matters --
+# unlike tests/smoke-enter.sh's equivalent assertion, which DOES fail
+# without the agent-enter.sh fix (that mount reads an EXISTING volume
+# without ever recreating it, so the poisoning persists there).
+# Never touches the real atelier-auth-* volumes.
+POISON_VOLUME="atelier-smoke-poison-probe-$$"
+POISON_FILE="${WORKDIR}/poison-probe.json"
+printf '{"probe":"poison"}' > "${POISON_FILE}"
+chmod 600 "${POISON_FILE}"
+
+POISON_OK=0
+if ATELIER_PODMAN="${PODMAN[*]}" "${REPO_ROOT}/scripts/auth-import.sh" "${POISON_VOLUME}" "${POISON_FILE}" >/dev/null 2>&1; then
+  "${PODMAN[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 \
+    -v "${POISON_VOLUME}:/dest:Z" "${IMAGE}" true >/dev/null 2>&1
+  if ATELIER_PODMAN="${PODMAN[*]}" "${REPO_ROOT}/scripts/auth-import.sh" "${POISON_VOLUME}" "${POISON_FILE}" >/dev/null 2>&1; then
+    POISON_READ_OUT="$("${PODMAN[@]}" run --rm \
+      --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --security-opt=no-new-privileges \
+      -v "${POISON_VOLUME}:/home/agent/.claude" \
+      "${IMAGE}" cat /home/agent/.claude/poison-probe.json 2>&1)" || true
+    [[ "$POISON_READ_OUT" == *'"probe":"poison"'* ]] && POISON_OK=1
+  fi
+fi
+"${PODMAN[@]}" volume rm "${POISON_VOLUME}" >/dev/null 2>&1 || true
+
+if [[ "$POISON_OK" -eq 1 ]]; then
+  pass "scripts/auth-import.sh: a volume previously :Z-poisoned by another container is still readable with a bare mount after re-import (:z resets the label)"
+else
+  fail "scripts/auth-import.sh: a volume previously :Z-poisoned by another container is still readable with a bare mount after re-import (got: ${POISON_READ_OUT:-<import failed>})"
+fi
+
 # --- 5. Only the three expected paths are mounted under $HOME -----------
 # A container with the three auth volumes actually mounted must show
 # exactly those three mount points under $HOME, and $HOME itself must
