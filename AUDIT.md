@@ -260,6 +260,20 @@ options rather than assumption, in `scripts/auth-login.sh`:
   not recreated (config and sessions live there too) and `codex logout`
   is never run: it could revoke a refresh token still shared with the
   host's copied `auth.json`.
+  **Observed 2026-09-27 (reported by Meute):** after the owner's first
+  `just auth-login codex`, the host's own Codex CLI returned 401
+  (workspace routing discovery unauthorized). Not reproduced here, since
+  that would take a real login. The likely cause is that the volume still
+  held the `auth.json` that `just auth` had copied from the host, and
+  replacing it revoked those tokens, which the host was still using. The
+  codex binary contains `login/src/auth/revoke.rs` and calls
+  `auth.openai.com/oauth/revoke`. A plain refresh race is less likely,
+  because that surfaces as "refresh token was already used" rather than
+  an access-token 401. Either way it is a one-time cost of migrating
+  away from a copied credential: the owner runs `codex login` on the host
+  once, the host and the volume then hold independent sessions, and
+  `just auth` no longer copies Codex credentials, so nothing can put them
+  back in a shared state.
 - **gh** — `gh auth login --with-token` with a PAT on stdin into exactly
   one of `atelier-auth-gh`, `atelier-auth-gh-publish`,
   `atelier-auth-gh-review`. The login and `gh auth status` run against
