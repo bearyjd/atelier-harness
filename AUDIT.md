@@ -480,7 +480,12 @@ volumes, for the reason in §4.1. Every bind mount of a directory stays
 
 **Read-only rootfs: verified and kept (Phase 2).** Agent containers run
 `--read-only` with tmpfs at `/tmp`, `/home/agent/.cache`,
-`/home/agent/.npm`, `/home/agent/.local/share` and `/home/agent/.config`,
+`/home/agent/.npm`, `/home/agent/.local/share`, `/home/agent/.local/state`
+(added 2026-09-30: gh 2.97 writes `device-id` there, silently lost on a
+read-only root) and `/home/agent/.config` -- every one under
+`/home/agent` with `:U` since 2026-09-30, because Podman had created
+`.local/share` root-owned 755 and not writable by the agent (`:U` chowns
+the tmpfs only; a volume mounted beneath it keeps its own ownership),
 with the three auth volumes mounted at their real paths (the `gh` volume
 sits under the `.config` tmpfs and stays writable). All CLIs report their
 versions, `git` works in `/work`, and `claude -p` reaches a clean

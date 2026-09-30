@@ -55,6 +55,38 @@
 # volumes, and the value never appears in `podman inspect` (verified).
 # See add_claude_secret_flag / check_container_secret below.
 #
+# STATE TMPFS (added 2026-09-30): gh 2.97 writes
+# ~/.local/state/gh/device-id on every run (auth-login.sh found it and
+# gave its gh containers this tmpfs). Probed here with this file's exact
+# flag set: `gh --version`, `gh config list`, `gh api` (GH_TOKEN set,
+# --network=none) all printed NO error -- the write fails silently -- but
+# device-id only appears once /home/agent/.local/state is a tmpfs, and
+# `mkdir` there fails with "Read-only file system" without it. Added for
+# every other XDG_STATE_HOME user too (bash/less history). It now lives in
+# hardened_flags (lib/atelier-common.sh), so auth-login's containers get
+# it from the same place.
+#
+# TMPFS OWNERSHIP (2026-09-30): the .local/share tmpfs came up root:root
+# 755 -- agent could not write to it. Every tmpfs under /home/agent now
+# takes `:U` (chown to the container user); the probe and the options
+# that were tried are in lib/atelier-common.sh (hardened_flags).
+#
+# Existing containers keep their old tmpfs flags until --rebuild; nothing
+# refuses them, since check_container_matches_request compares only /work
+# and network.
+#
+# STDIN RULE for every podman call in this file (found 2026-09-27 in
+# auth-login.sh, reproduced here 2026-09-30): inside the `dev` distrobox,
+# distrobox-host-exec gives host-spawn a pty whenever stdout is a TTY, and
+# in that mode it echoes piped stdin to the terminal and SWALLOWS it --
+# even for a call that never reads stdin. `printf canary | agent-enter.sh
+# --no-tmux -- cat` under a pty printed the canary once (echoed by a
+# preflight inspect) and hung 60s, the command never seeing it. So every
+# podman call (and every `just build`, which runs podman) gets
+# `</dev/null`, except the final exec that is meant to receive stdin (see
+# enter_no_tmux). tmux calls don't: the pane's podman exec reads the
+# pane's own tty, never this script's stdin, and attach needs the terminal.
+#
 # Functions are kept under 50 lines each; no `|| true` hides a real
 # failure anywhere in this file.
 set -euo pipefail
@@ -65,17 +97,30 @@ set -euo pipefail
 # directory as `agent-enter`) -- readlink -f resolves the symlink chain
 # before deriving the repo root, and `pwd -P` resolves any symlink
 # components in the directory walk itself.
-REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)"
+# Locating the lib FAILS CLOSED (security review, 2026-09-30): fed on
+# stdin (`bash < agent-enter.sh`) BASH_SOURCE[0] is empty, and the old
+# `dirname "$(readlink -f "")"` quietly became "." -- the CWD -- so a
+# lib/atelier-common.sh in whatever directory the caller stood in would
+# have been sourced. Separate assignments, so errexit sees each failure.
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  echo "agent-enter: cannot locate this script (BASH_SOURCE is empty); run it as a file from the repo checkout, not on stdin" >&2
+  exit 1
+fi
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(cd "${SELF_PATH%/*}/.." && pwd -P)"
+# PODMAN routing, CLAUDE_SECRET, the EGRESS_* defaults (and their
+# ATELIER_* overrides), hardened_flags and the proxy helpers.
+ATELIER_LIB="${REPO_ROOT}/scripts/lib/atelier-common.sh"
+if [[ "$ATELIER_LIB" != /* || ! -f "$ATELIER_LIB" ]]; then
+  echo "agent-enter: missing ${ATELIER_LIB}; run from the repo checkout" >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/atelier-common.sh
+source "$ATELIER_LIB"
 DEFAULT_NETWORK="proxied"
-EGRESS_CONTAINER="${ATELIER_EGRESS_HOST:-atelier-egress}"
-EGRESS_NETWORK="${ATELIER_EGRESS_NET:-atelier-internal}"
-EGRESS_PORT="${ATELIER_EGRESS_PORT:-3128}"
 AUTH_VOLUME_CLAUDE="${ATELIER_AUTH_VOLUME_CLAUDE:-atelier-auth-claude}"
 AUTH_VOLUME_CODEX="${ATELIER_AUTH_VOLUME_CODEX:-atelier-auth-codex}"
 AUTH_VOLUME_GH="${ATELIER_AUTH_VOLUME_GH:-atelier-auth-gh}"
-# Default name is part of the Meute contract (README.md); the override
-# exists so tests/smoke-enter.sh never injects the owner's real token.
-CLAUDE_SECRET="${ATELIER_CLAUDE_SECRET:-atelier-claude-token}"
 CLAUDE_TOKEN_ENV="CLAUDE_CODE_OAUTH_TOKEN"
 
 # H5: fail loudly, naming the resolved root, rather than crash later with a
@@ -89,23 +134,10 @@ assert_repo_root() {
   fi
 }
 
-# --- podman / tmux wrappers (AUDIT.md §4.4) ---------------------------------
-# `podman` is only a shell alias to `distrobox-host-exec podman` inside the
-# `dev` distrobox; aliases don't expand in scripts. tmux is NOT routed
+# --- tmux wrapper (AUDIT.md §4.4) -------------------------------------------
+# resolve_podman lives in lib/atelier-common.sh. tmux is NOT routed
 # through distrobox-host-exec: the session is created where this script is
 # invoked (AUDIT.md §4.4), only the podman calls cross to the host.
-resolve_podman() {
-  if [[ -f /run/.containerenv ]] && command -v distrobox-host-exec >/dev/null 2>&1; then
-    PODMAN=(distrobox-host-exec podman)
-  else
-    PODMAN=(podman)
-  fi
-  if [[ -n "${ATELIER_PODMAN:-}" ]]; then
-    # shellcheck disable=SC2206
-    PODMAN=(${ATELIER_PODMAN})
-  fi
-}
-
 resolve_tmux() {
   TMUX_CMD=(tmux)
   if [[ -n "${ATELIER_TMUX:-}" ]]; then
@@ -278,13 +310,13 @@ resolve_image_name() {
 }
 
 ensure_image_built() {
-  if "${PODMAN[@]}" image exists "$IMAGE" 2>/dev/null; then
+  if "${PODMAN[@]}" image exists "$IMAGE" 2>/dev/null </dev/null; then
     return 0
   fi
   require_just
   if [[ -f "${REPO_ROOT}/containers/${PROJECT}/Containerfile" ]]; then
     echo "agent-enter: image ${IMAGE} not found; building via 'just build ${PROJECT}'" >&2
-    (cd "$REPO_ROOT" && just build "$PROJECT")
+    (cd "$REPO_ROOT" && just build "$PROJECT") </dev/null
   else
     echo "agent-enter: image ${IMAGE} not found; run 'just build-base' first" >&2
     exit 1
@@ -322,7 +354,7 @@ expected_source_sha() {
 check_staleness() {
   local expected actual
   expected="$(expected_source_sha)"
-  actual="$("${PODMAN[@]}" image inspect "$IMAGE" --format '{{index .Labels "org.atelier.source-sha"}}' 2>/dev/null)" || actual=""
+  actual="$("${PODMAN[@]}" image inspect "$IMAGE" --format '{{index .Labels "org.atelier.source-sha"}}' 2>/dev/null </dev/null)" || actual=""
   if [[ -z "$actual" ]]; then
     echo "agent-enter: warning: ${IMAGE} has no org.atelier.source-sha label (<missing>); treating it as stale. Pass --rebuild to rebuild." >&2
   elif [[ "$actual" != "$expected" ]]; then
@@ -332,10 +364,10 @@ check_staleness() {
 }
 
 check_container_image_drift() {
-  "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null || return 0
+  "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null </dev/null || return 0
   local container_image_id current_image_id
-  container_image_id="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.Image}}')"
-  current_image_id="$("${PODMAN[@]}" image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null)" || current_image_id=""
+  container_image_id="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.Image}}' </dev/null)"
+  current_image_id="$("${PODMAN[@]}" image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null </dev/null)" || current_image_id=""
   if [[ -n "$current_image_id" && "$container_image_id" != "$current_image_id" ]]; then
     echo "agent-enter: warning: container ${CONTAINER} was created from an older ${IMAGE} (the image has changed since); pass --rebuild to recreate" >&2
   fi
@@ -345,10 +377,12 @@ check_container_image_drift() {
 # H3/Codex MEDIUM: called on every proxied start AND every proxied reuse
 # (from ensure_container, both branches), not only before create -- a dead
 # proxy must be reported whichever branch is taken, including after a host
-# reboot restarting a stopped persistent container.
+# reboot restarting a stopped persistent container. egress_is_running is
+# shared with auth-login.sh (lib/atelier-common.sh); the message is ours
+# (tests/smoke-enter.sh 11 asserts it).
 check_network_preflight() {
   [[ "$NETWORK" == "proxied" ]] || return 0
-  if ! "${PODMAN[@]}" inspect "$EGRESS_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+  if ! egress_is_running; then
     echo "agent-enter: --network=proxied requires ${EGRESS_CONTAINER} to be running; run: just egress-up" >&2
     exit 1
   fi
@@ -367,8 +401,8 @@ check_network_preflight() {
 # the fallback for a portability edge case, not the default path.
 ensure_auth_volume() {
   local vol="$1" mp contents
-  "${PODMAN[@]}" volume exists "$vol" 2>/dev/null || "${PODMAN[@]}" volume create "$vol" >/dev/null
-  mp="$("${PODMAN[@]}" volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null)" || mp=""
+  "${PODMAN[@]}" volume exists "$vol" 2>/dev/null </dev/null || "${PODMAN[@]}" volume create "$vol" >/dev/null </dev/null
+  mp="$("${PODMAN[@]}" volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null </dev/null)" || mp=""
   if [[ -n "$mp" && -r "$mp" ]]; then
     contents="$(ls -A "$mp" 2>/dev/null)"
   else
@@ -394,7 +428,7 @@ probe_volume_contents() {
     --network=none --cap-drop=ALL --security-opt=no-new-privileges \
     --read-only --userns=keep-id:uid=1000,gid=1000 \
     -v "${vol}:/probe:ro,z" \
-    agent-base:latest bash -c 'ls -A /probe 2>/dev/null'
+    agent-base:latest bash -c 'ls -A /probe 2>/dev/null' </dev/null
 }
 
 ensure_auth_volumes() {
@@ -421,23 +455,22 @@ ensure_auth_volumes() {
 # otherwise buy here is illusory anyway: reading a named volume already
 # requires knowing its name and mounting it explicitly, which is exactly
 # the access a shared label grants and nothing more.
+#
+# The base set (keep-id, cap-drop, no-new-privileges, --init, pids-limit,
+# --read-only, /tmp, .cache and .local/state tmpfs) is hardened_flags,
+# shared with auth-login.sh; the rest is per-project. `:U` on every tmpfs
+# under /home/agent: see TMPFS OWNERSHIP in the header.
 build_run_flags() {
+  hardened_flags
   RUN_FLAGS=(
     -d
-    --userns=keep-id:uid=1000,gid=1000
+    "${HARDENED_FLAGS[@]}"
     --volume "${DIR}:/work:Z"
-    --cap-drop=ALL
-    --security-opt=no-new-privileges
-    --init
-    --pids-limit=2048
     --name "$CONTAINER"
     --hostname "$CONTAINER"
-    --read-only
-    --tmpfs /tmp
-    --tmpfs /home/agent/.cache
-    --tmpfs /home/agent/.npm
-    --tmpfs /home/agent/.local/share
-    --tmpfs /home/agent/.config
+    --tmpfs /home/agent/.npm:U
+    --tmpfs /home/agent/.local/share:U
+    --tmpfs /home/agent/.config:U
     -v "${AUTH_VOLUME_CLAUDE}:/home/agent/.claude:z"
     -v "${AUTH_VOLUME_CODEX}:/home/agent/.codex:z"
     -v "${AUTH_VOLUME_GH}:/home/agent/.config/gh:z"
@@ -451,37 +484,17 @@ build_run_flags() {
   RUN_FLAGS+=("$IMAGE")
 }
 
-
-# atelier-internal is created with --disable-dns (Justfile egress-up):
-# Podman used to order /etc/resolv.conf's nameservers non-deterministically
-# when a container joined two networks, and the network's own aardvark-dns
-# entry racing the injected --dns entries caused agent-base's own DNS to
-# be unreliable too. Disabling DNS on the network removes that race
-# entirely, but it also means aardvark no longer resolves the
-# "atelier-egress" name for anything on that network -- nothing provides
-# it anymore. --add-host maps the name statically instead, reading the
-# proxy's actual IP from a running container rather than hardcoding a
-# second copy of the Justfile's egress_ip constant, so the two cannot
-# drift apart the way a duplicated constant eventually would.
-egress_ip_on_network() {
-  "${PODMAN[@]}" inspect "$EGRESS_CONTAINER" \
-    --format "{{with index .NetworkSettings.Networks \"${EGRESS_NETWORK}\"}}{{.IPAddress}}{{end}}" 2>/dev/null
-}
-
+# egress_ip_on_network and proxy_flags live in lib/atelier-common.sh (see
+# its comment for why the proxy's IP is read live and mapped --add-host).
 add_proxy_flags() {
-  local proxy_url="http://${EGRESS_CONTAINER}:${EGRESS_PORT}" egress_ip
-  egress_ip="$(egress_ip_on_network)"
+  local egress_ip
+  egress_ip="$(egress_ip_on_network)" || egress_ip=""
   if [[ -z "$egress_ip" ]]; then
     echo "agent-enter: could not determine ${EGRESS_CONTAINER}'s address on ${EGRESS_NETWORK}; is it attached to that network? (run: just egress-up)" >&2
     exit 1
   fi
-  RUN_FLAGS+=(
-    --network="$EGRESS_NETWORK"
-    --add-host "${EGRESS_CONTAINER}:${egress_ip}"
-    -e "HTTPS_PROXY=${proxy_url}" -e "https_proxy=${proxy_url}"
-    -e "HTTP_PROXY=${proxy_url}" -e "http_proxy=${proxy_url}"
-    -e "NO_PROXY=localhost,127.0.0.1" -e "no_proxy=localhost,127.0.0.1"
-  )
+  proxy_flags "$egress_ip"
+  RUN_FLAGS+=("${PROXY_FLAGS[@]}")
 }
 
 # --- Claude token secret (AUDIT.md §4.1) ------------------------------------
@@ -494,7 +507,7 @@ warn_no_claude_secret() {
 }
 
 add_claude_secret_flag() {
-  if "${PODMAN[@]}" secret exists "$CLAUDE_SECRET" 2>/dev/null; then
+  if "${PODMAN[@]}" secret exists "$CLAUDE_SECRET" 2>/dev/null </dev/null; then
     RUN_FLAGS+=(--secret "${CLAUDE_SECRET},type=env,target=${CLAUDE_TOKEN_ENV}")
   else
     warn_no_claude_secret
@@ -517,7 +530,7 @@ add_claude_secret_flag() {
 container_claude_secret() {
   local create_cmd arg
   REFERENCED_SECRET=""
-  create_cmd="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{range .Config.CreateCommand}}{{println .}}{{end}}')"
+  create_cmd="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{range .Config.CreateCommand}}{{println .}}{{end}}' </dev/null)"
   while IFS= read -r arg; do
     if [[ "$arg" == *",type=env,target=${CLAUDE_TOKEN_ENV}" ]]; then
       REFERENCED_SECRET="${arg%%,*}"
@@ -548,7 +561,7 @@ check_container_secret() {
   container_claude_secret
   referenced="$REFERENCED_SECRET"
   if [[ -z "$referenced" ]]; then
-    if "${PODMAN[@]}" secret exists "$CLAUDE_SECRET" 2>/dev/null; then
+    if "${PODMAN[@]}" secret exists "$CLAUDE_SECRET" 2>/dev/null </dev/null; then
       echo "agent-enter: container ${CONTAINER} was created without the Claude token secret ${CLAUDE_SECRET}, which exists now; a secret can only be attached at creation, so pass --rebuild to recreate it" >&2
       exit 4
     fi
@@ -559,8 +572,8 @@ check_container_secret() {
     echo "agent-enter: container ${CONTAINER} was created with the Podman secret ${referenced}, but the configured Claude token secret is ${CLAUDE_SECRET}; pass --rebuild to recreate it with the configured one" >&2
     exit 4
   fi
-  running="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.State.Running}}')"
-  if [[ "$running" != "true" ]] && ! "${PODMAN[@]}" secret exists "$referenced" 2>/dev/null; then
+  running="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.State.Running}}' </dev/null)"
+  if [[ "$running" != "true" ]] && ! "${PODMAN[@]}" secret exists "$referenced" 2>/dev/null </dev/null; then
     echo "agent-enter: container ${CONTAINER} was created with the Podman secret ${referenced}, which no longer exists, so it cannot be started; recreate the secret (just auth-login claude) or pass --rebuild to recreate the container" >&2
     exit 4
   fi
@@ -574,12 +587,12 @@ do_rebuild() {
   fi
   require_just
   if [[ -f "${REPO_ROOT}/containers/${PROJECT}/Containerfile" ]]; then
-    (cd "$REPO_ROOT" && just build "$PROJECT")
+    (cd "$REPO_ROOT" && just build "$PROJECT") </dev/null
   else
-    (cd "$REPO_ROOT" && just build-base)
+    (cd "$REPO_ROOT" && just build-base) </dev/null
   fi
-  if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null; then
-    "${PODMAN[@]}" rm -f "$CONTAINER" >/dev/null
+  if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null </dev/null; then
+    "${PODMAN[@]}" rm -f "$CONTAINER" >/dev/null </dev/null
   fi
 }
 
@@ -594,7 +607,7 @@ do_rebuild() {
 # and point at --rebuild.
 ensure_container() {
   check_staleness
-  if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null; then
+  if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null </dev/null; then
     check_network_preflight
     check_container_matches_request
     check_container_secret
@@ -603,19 +616,19 @@ ensure_container() {
     check_network_preflight
     ensure_auth_volumes
     build_run_flags
-    "${PODMAN[@]}" run "${RUN_FLAGS[@]}" >/dev/null
+    "${PODMAN[@]}" run "${RUN_FLAGS[@]}" >/dev/null </dev/null
   fi
 }
 
 check_container_matches_request() {
   local existing_work network_mode networks
-  existing_work="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Source}}{{end}}{{end}}')"
+  existing_work="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Source}}{{end}}{{end}}' </dev/null)"
   if [[ "$existing_work" != "$DIR" ]]; then
     echo "agent-enter: container ${CONTAINER} has ${existing_work} at /work, not ${DIR}; pass --rebuild to recreate it, or use a different --project" >&2
     exit 4
   fi
-  network_mode="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.HostConfig.NetworkMode}}')"
-  networks="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{json .NetworkSettings.Networks}}')"
+  network_mode="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.HostConfig.NetworkMode}}' </dev/null)"
+  networks="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{json .NetworkSettings.Networks}}' </dev/null)"
   if [[ "$NETWORK" == "none" && "$network_mode" != "none" ]]; then
     echo "agent-enter: container ${CONTAINER} was created with network profile 'proxied', not 'none'; pass --rebuild to recreate it" >&2
     exit 4
@@ -628,8 +641,8 @@ check_container_matches_request() {
 
 start_if_stopped() {
   local running
-  running="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.State.Running}}')"
-  [[ "$running" == "true" ]] || "${PODMAN[@]}" start "$CONTAINER" >/dev/null
+  running="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.State.Running}}' </dev/null)"
+  [[ "$running" == "true" ]] || "${PODMAN[@]}" start "$CONTAINER" >/dev/null </dev/null
 }
 
 # --- Shell layer -------------------------------------------------------------
@@ -681,9 +694,30 @@ sh_quote_words() {
   printf '%s' "$out"
 }
 
+# The one podman call that is MEANT to get the caller's stdin, so no
+# `</dev/null`. It is `exec`, so this script's PID becomes podman's and
+# signals reach it directly -- EXCEPT in exactly the trigger case of the
+# STDIN RULE above: stdin piped (not a terminal) AND stdout a terminal.
+# There stdout goes through `| cat`, because a stdin-fed podman call must
+# never have a TTY stdout -- verified 2026-09-30, `printf x |
+# distrobox-host-exec podman exec -i C tr a-z A-Z` under a pty echoed x
+# and hung (no EOF); with `| cat` it printed X and exited 0.
+#
+# On that `| cat` path, under pipefail the result is the rightmost
+# non-zero status: podman's (the command's own, e.g. 42) unless cat
+# itself fails -- e.g. SIGPIPE/EIO when the terminal goes away -- in
+# which case cat's status wins. Signals are NOT forwarded: bash defers
+# traps until a foreground pipeline finishes, so a trap here could not
+# relay them. Ctrl-C/hangup from the terminal already reach the whole
+# pipeline (it is the terminal's foreground job); a program stopping this
+# must signal the process group (`kill -TERM -- -<pgid>`), not the PID.
 enter_no_tmux() {
   ensure_container
   container_exec_flags
+  if [[ ! -t 0 && -t 1 ]]; then
+    "${PODMAN[@]}" "${EXEC_FLAGS[@]}" | cat
+    return
+  fi
   exec "${PODMAN[@]}" "${EXEC_FLAGS[@]}"
 }
 

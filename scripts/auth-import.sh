@@ -22,15 +22,26 @@
 # real credentials to be exercised by the smoke suite).
 set -euo pipefail
 
-if [[ -f /run/.containerenv ]] && command -v distrobox-host-exec >/dev/null 2>&1; then
-  PODMAN=(distrobox-host-exec podman)
-else
-  PODMAN=(podman)
+# Only resolve_podman is used from the shared lib: this script's container
+# is deliberately NOT the hardened agent set (no --read-only, no proxy).
+# Locating the lib FAILS CLOSED (security review, 2026-09-30): fed on
+# stdin (`bash < auth-import.sh`) BASH_SOURCE[0] is empty, and the old
+# `dirname "$(readlink -f "")"` quietly became "." -- the CWD -- so a
+# lib/atelier-common.sh in whatever directory the caller stood in would
+# have been sourced. Separate assignments, so errexit sees each failure.
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  echo "auth-import: cannot locate this script (BASH_SOURCE is empty); run it as a file from the repo checkout, not on stdin" >&2
+  exit 1
 fi
-if [[ -n "${ATELIER_PODMAN:-}" ]]; then
-  # shellcheck disable=SC2206
-  PODMAN=(${ATELIER_PODMAN})
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ATELIER_LIB="${SELF_PATH%/*}/lib/atelier-common.sh"
+if [[ "$ATELIER_LIB" != /* || ! -f "$ATELIER_LIB" ]]; then
+  echo "auth-import: missing ${ATELIER_LIB}; run from the repo checkout" >&2
+  exit 1
 fi
+# shellcheck source=scripts/lib/atelier-common.sh
+source "$ATELIER_LIB"
+resolve_podman
 
 IMAGE="${ATELIER_AUTH_IMAGE:-agent-base:latest}"
 
@@ -53,10 +64,12 @@ fi
 # into a volume that already held a first one -- both survived. A rotated
 # credential must not leave the stale file behind, so re-runs of this
 # script replace the volume's entire contents.
-if "${PODMAN[@]}" volume exists "$volume" 2>/dev/null; then
-  "${PODMAN[@]}" volume rm "$volume" >/dev/null
+# `</dev/null` on these three: STDIN RULE (see the `| cat` comment below)
+# -- none of them reads stdin, and in pty mode any of them would eat it.
+if "${PODMAN[@]}" volume exists "$volume" 2>/dev/null </dev/null; then
+  "${PODMAN[@]}" volume rm "$volume" >/dev/null </dev/null
 fi
-"${PODMAN[@]}" volume create "$volume" >/dev/null
+"${PODMAN[@]}" volume create "$volume" >/dev/null </dev/null
 
 # --network=none unconditionally: this container only ever needs to
 # extract a tar stream into a volume, and $ATELIER_AUTH_IMAGE is

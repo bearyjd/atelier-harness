@@ -201,9 +201,27 @@ build-all: build-base build-egress
 smoke:
     "{{justfile_directory()}}/tests/smoke.sh"
 
-# Run the agent-enter.sh state-machine smoke test (needs `just build example` and `just egress-up` first).
+# The container layer, then the tmux layer, then stdin/pty handling --
+# strictly one after another (never two suites on atelier-egress at once).
+# Test failures (exit 1) still let the later suites run; a REFUSAL (exit 2:
+# a failed precondition, e.g. a live agent-example session) stops the
+# recipe there, so nothing else starts containers beside that session.
+# Run the agent-enter.sh smoke tests (needs `just build example` and `just egress-up` first).
 smoke-enter:
-    "{{justfile_directory()}}/tests/smoke-enter.sh"
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    for suite in smoke-enter smoke-enter-tmux smoke-enter-pty; do
+        status=0
+        "{{justfile_directory()}}/tests/${suite}.sh" || status=$?
+        echo
+        if [[ "$status" -eq 2 ]]; then
+            echo "tests/${suite}.sh refused to run (precondition failed); not starting the remaining suites" >&2
+            exit 2
+        fi
+        [[ "$status" -eq 0 ]] || rc=1
+    done
+    exit "$rc"
 
 # Create/refresh the atelier-internal network and the egress proxy container.
 egress-up: build-egress

@@ -21,25 +21,33 @@
 # Real logins cannot be exercised headless; tests/smoke.sh covers the
 # argument refusals and the whole claude path with a dummy token and a
 # throwaway secret name (ATELIER_CLAUDE_SECRET).
-#
-# Shares its podman routing, proxy preflight and proxy flags with
-# agent-enter.sh by DUPLICATION, not a sourced library -- a known cost,
-# kept deliberately small; a change to either copy needs the other.
 set -euo pipefail
 # xtrace off before anything touches a secret: an inherited `set -x`
 # (e.g. `bash -x` or SHELLOPTS from a debugging session) printed the
 # token 7 times in review (2026-09-27) -- once per expansion of it.
 { set +x; } 2>/dev/null
 
-if [[ -f /run/.containerenv ]] && command -v distrobox-host-exec >/dev/null 2>&1; then
-  PODMAN=(distrobox-host-exec podman)
-else
-  PODMAN=(podman)
+# Podman routing, CLAUDE_SECRET (default + ATELIER_CLAUDE_SECRET override),
+# the EGRESS_* defaults, hardened_flags and the proxy helpers are shared
+# with agent-enter.sh (2026-09-30; they were hand-kept duplicates before).
+# Locating the lib FAILS CLOSED (security review, 2026-09-30): fed on
+# stdin (`bash < auth-login.sh`) BASH_SOURCE[0] is empty, and the old
+# `dirname "$(readlink -f "")"` quietly became "." -- the CWD -- so a
+# lib/atelier-common.sh in whatever directory the caller stood in would
+# have been sourced. Separate assignments, so errexit sees each failure.
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  echo "auth-login: cannot locate this script (BASH_SOURCE is empty); run it as a file from the repo checkout, not on stdin" >&2
+  exit 1
 fi
-if [[ -n "${ATELIER_PODMAN:-}" ]]; then
-  # shellcheck disable=SC2206
-  PODMAN=(${ATELIER_PODMAN})
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ATELIER_LIB="${SELF_PATH%/*}/lib/atelier-common.sh"
+if [[ "$ATELIER_LIB" != /* || ! -f "$ATELIER_LIB" ]]; then
+  echo "auth-login: missing ${ATELIER_LIB}; run from the repo checkout" >&2
+  exit 1
 fi
+# shellcheck source=scripts/lib/atelier-common.sh
+source "$ATELIER_LIB"
+resolve_podman
 # STDIN RULE for every podman call below (found 2026-09-27): inside the
 # `dev` distrobox, distrobox-host-exec gives host-spawn a pty whenever
 # stdout is a TTY, and in that mode it both echoes piped stdin to the
@@ -55,13 +63,7 @@ fi
 # code of the caller's choosing holding a live credential on a network.
 # The claude path runs no container at all, so tests need no override.
 IMAGE="agent-base:latest"
-# The default secret name is part of the Meute contract (README.md) --
-# Meute consumes it by this exact name. Override only for tests.
-CLAUDE_SECRET="${ATELIER_CLAUDE_SECRET:-atelier-claude-token}"
 CODEX_VOLUME="${ATELIER_AUTH_VOLUME_CODEX:-atelier-auth-codex}"
-EGRESS_CONTAINER="${ATELIER_EGRESS_HOST:-atelier-egress}"
-EGRESS_NETWORK="${ATELIER_EGRESS_NET:-atelier-internal}"
-EGRESS_PORT="${ATELIER_EGRESS_PORT:-3128}"
 GH_VOLUMES=(atelier-auth-gh atelier-auth-gh-publish atelier-auth-gh-review)
 
 usage() {
@@ -69,35 +71,15 @@ usage() {
   exit 2
 }
 
-# Same hardened set agent containers run with (AUDIT.md §4.3, including
-# --init and --pids-limit), plus --read-only. `codex login --help` and
-# `codex login --device-auth` were run under these flags on 2026-09-27:
-# help exits 0, and device-auth reached the device-code prompt through
-# the proxy, so these two tmpfs mounts are all codex's login needs. gh
-# additionally gets GH_EXTRA_FLAGS (see login_gh).
-hardened_flags() {
-  HARDENED_FLAGS=(
-    --userns=keep-id:uid=1000,gid=1000
-    --cap-drop=ALL
-    --security-opt=no-new-privileges
-    --init
-    --pids-limit=2048
-    --read-only
-    --tmpfs /tmp
-    --tmpfs /home/agent/.cache
-  )
-}
-
-# The same preflight and flags as agent-enter.sh's proxied profile
-# (check_network_preflight, egress_ip_on_network, add_proxy_flags): the
-# codex and gh logins both need auth.openai.com / api.github.com, which
-# are on the allow-list. Claude's browser flow is NOT, which is why that
-# one runs on the host instead -- the allow-list is not widened for it.
-proxy_flags() {
-  local proxy_url="http://${EGRESS_CONTAINER}:${EGRESS_PORT}" egress_ip
-  # String compare, not `| grep -q true`: grep -q exits at the first
-  # match, and under pipefail the writer's SIGPIPE can fail the pipeline.
-  if [[ "$("${PODMAN[@]}" inspect "$EGRESS_CONTAINER" --format '{{.State.Running}}' 2>/dev/null </dev/null)" != "true" ]]; then
+# The same egress check, IP lookup and flags as agent-enter.sh's proxied
+# profile (lib/atelier-common.sh), plus a `network exists` check, with
+# this script's own messages: the codex and gh logins both need
+# auth.openai.com / api.github.com, which are on the allow-list. Claude's
+# browser flow is NOT, which is why that one runs on the host instead --
+# the allow-list is not widened for it. Sets PROXY_FLAGS.
+proxy_preflight() {
+  local egress_ip
+  if ! egress_is_running; then
     echo "auth-login: this login needs ${EGRESS_CONTAINER} running (it goes through the egress proxy); run: just egress-up" >&2
     exit 1
   fi
@@ -105,19 +87,12 @@ proxy_flags() {
     echo "auth-login: network ${EGRESS_NETWORK} does not exist; run: just egress-up" >&2
     exit 1
   fi
-  egress_ip="$("${PODMAN[@]}" inspect "$EGRESS_CONTAINER" \
-    --format "{{with index .NetworkSettings.Networks \"${EGRESS_NETWORK}\"}}{{.IPAddress}}{{end}}" 2>/dev/null </dev/null)" || egress_ip=""
+  egress_ip="$(egress_ip_on_network)" || egress_ip=""
   if [[ -z "$egress_ip" ]]; then
     echo "auth-login: could not determine ${EGRESS_CONTAINER}'s address on ${EGRESS_NETWORK}; run: just egress-up" >&2
     exit 1
   fi
-  PROXY_FLAGS=(
-    --network="$EGRESS_NETWORK"
-    --add-host "${EGRESS_CONTAINER}:${egress_ip}"
-    -e "HTTPS_PROXY=${proxy_url}" -e "https_proxy=${proxy_url}"
-    -e "HTTP_PROXY=${proxy_url}" -e "http_proxy=${proxy_url}"
-    -e "NO_PROXY=localhost,127.0.0.1" -e "no_proxy=localhost,127.0.0.1"
-  )
+  proxy_flags "$egress_ip"
 }
 
 # Reads one secret into $SECRET_INPUT: hidden prompt on a TTY, otherwise
@@ -186,9 +161,18 @@ EOF
 # -- a logout would then sign the HOST out as well. The volume is not
 # recreated either (unlike gh): it also holds codex's config and session
 # history, and a successful login simply overwrites auth.json.
+#
+# hardened_flags (lib/atelier-common.sh) is the same hardened set agent
+# containers run with (AUDIT.md §4.3, including --init and --pids-limit),
+# plus --read-only. `codex login --help` and `codex login --device-auth`
+# were run under these flags on 2026-09-27: help exits 0, and device-auth
+# reached the device-code prompt through the proxy, so the /tmp and
+# .cache tmpfs mounts were all codex's login needs. Re-checked 2026-09-30
+# after .cache/.local/state became `:U` tmpfs in the set: `codex login
+# --help` still exits 0 (with the known harmless PATH-aliases warning).
 login_codex() {
   hardened_flags
-  proxy_flags
+  proxy_preflight
   echo "auth-login: starting codex device-code login into volume ${CODEX_VOLUME}"
   echo "auth-login: if ChatGPT refuses the device code, enable device-code login in ChatGPT's security settings and re-run"
   # -t only with a terminal on stdin, like agent-enter.sh's
@@ -218,11 +202,7 @@ login_codex() {
 login_gh() {
   local vol="$1"
   hardened_flags
-  proxy_flags
-  # gh writes ~/.local/state/gh/device-id on every run, even a failed
-  # login (found 2026-09-27 with `find -newer` in a writable container);
-  # without this tmpfs that write hits the read-only rootfs.
-  GH_EXTRA_FLAGS=(--tmpfs /home/agent/.local/state)
+  proxy_preflight
   check_volume_unused "$vol"
   read_secret_input "GitHub PAT for ${vol}"
   STAGING_VOLUME="${vol}-staging-$$"
@@ -233,13 +213,13 @@ login_gh() {
   # `| cat`: stdout of a stdin-fed podman call must never be a TTY (see
   # login_claude) -- without it the PAT is echoed to the terminal.
   printf '%s\n' "$SECRET_INPUT" | "${PODMAN[@]}" run --rm -i \
-    "${HARDENED_FLAGS[@]}" "${GH_EXTRA_FLAGS[@]}" "${PROXY_FLAGS[@]}" \
+    "${HARDENED_FLAGS[@]}" "${PROXY_FLAGS[@]}" \
     -v "${STAGING_VOLUME}:/home/agent/.config/gh:z" \
     "$IMAGE" \
     gh auth login --with-token --hostname github.com --git-protocol https --insecure-storage \
     | cat
   "${PODMAN[@]}" run --rm \
-    "${HARDENED_FLAGS[@]}" "${GH_EXTRA_FLAGS[@]}" "${PROXY_FLAGS[@]}" \
+    "${HARDENED_FLAGS[@]}" "${PROXY_FLAGS[@]}" \
     -v "${STAGING_VOLUME}:/home/agent/.config/gh:ro,z" \
     "$IMAGE" \
     gh auth status --hostname github.com </dev/null

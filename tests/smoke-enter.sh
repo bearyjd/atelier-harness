@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Smoke test for scripts/agent-enter.sh: the tmux -> container -> shell
-# state machine, the AUDIT.md §4.3 flag set, network profiles, staleness
-# detection, --rebuild, and self-refusal (README.md "must never be
-# /work"). Run with `just smoke-enter` or directly: tests/smoke-enter.sh
+# Smoke test for scripts/agent-enter.sh's container layer: the AUDIT.md
+# §4.3 flag set, tmpfs layout, network profiles, staleness detection,
+# --rebuild, reuse refusals, the claude token secret, and self-refusal
+# (README.md "must never be /work"). Run with `just smoke-enter` (which
+# also runs smoke-enter-tmux.sh and smoke-enter-pty.sh) or directly.
 #
 # REVISED after the Phase 2 code review (.omc/reviews/phase2-code-review.md)
 # and Codex pass (.omc/reviews/phase2-codex.md). Design rules this version
@@ -28,26 +29,28 @@
 #     which the trap removes; nothing is hardcoded under bare /tmp.
 #   - L2/L3: no `A && pass || fail`; the private tmux socket file is
 #     removed in cleanup.
+#   - Cleanup is armed only after the preconditions pass, so a refusal
+#     never removes anything (tests/lib/smoke-common.sh CLEANUP CONTRACT).
 #
-# Non-interactive throughout: container-layer checks use --no-tmux (no TTY
-# needed), and tmux-layer checks use a private tmux socket
-# (`tmux -L atelier-test`, via agent-enter.sh's ATELIER_TMUX override) so
-# this never touches the operator's real tmux server.
+# Split 2026-09-30, when this file hit the 800-line cap: the tmux-layer
+# checks (old sections 12-14) moved to tests/smoke-enter-tmux.sh and the
+# piped-stdin/pty checks to tests/smoke-enter-pty.sh; shared helpers are
+# in tests/lib/smoke-common.sh. Section numbers below are unchanged.
+#
+# Non-interactive throughout: every check uses --no-tmux (no TTY needed).
 set -euo pipefail
-
-if [[ -f /run/.containerenv ]] && command -v distrobox-host-exec >/dev/null 2>&1; then
-  PODMAN=(distrobox-host-exec podman)
-else
-  PODMAN=(podman)
-fi
-if [[ -n "${ATELIER_PODMAN:-}" ]]; then
-  # shellcheck disable=SC2206
-  PODMAN=(${ATELIER_PODMAN})
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENTER="${REPO_ROOT}/scripts/agent-enter.sh"
+# shellcheck source=tests/lib/smoke-common.sh
+source "${SCRIPT_DIR}/lib/smoke-common.sh"
+# Only for resolve_podman (the same routing agent-enter.sh uses). Every
+# EXPECTED value below is a literal of this suite's own, never read from
+# the lib -- a wrong default in the lib must fail here, not be mirrored.
+# shellcheck source=scripts/lib/atelier-common.sh
+source "${REPO_ROOT}/scripts/lib/atelier-common.sh"
+resolve_podman
 
 # TEST_PROJECT is fixed at "example" -- it MUST match containers/example/
 # (README.md "Overlay convention") so container/session naming and image
@@ -58,12 +61,10 @@ ENTER="${REPO_ROOT}/scripts/agent-enter.sh"
 # separate scratch overlay and tag instead.
 TEST_PROJECT="example"
 CONTAINER="agent-${TEST_PROJECT}"
-SESSION="agent-${TEST_PROJECT}"
-TMUX_SOCKET="atelier-test"
-TMUX_CMD=(tmux -L "$TMUX_SOCKET")
 PROBE_IP="1.1.1.1"
 # Same env-var overrides agent-enter.sh itself honours, so a caller who
-# points one at a nonstandard name points both consistently.
+# points one at a nonstandard name points both consistently; the defaults
+# are the contract literals (README.md).
 EGRESS_CONTAINER="${ATELIER_EGRESS_HOST:-atelier-egress}"
 EGRESS_NETWORK="${ATELIER_EGRESS_NET:-atelier-internal}"
 
@@ -71,8 +72,6 @@ EGRESS_NETWORK="${ATELIER_EGRESS_NET:-atelier-internal}"
 # with TEST_PROJECT or with each other.
 MISMATCH_PROJECT="smoke-mismatch-$$"
 NONE_PROJECT="smoke-none-$$"
-DOTTED_PROJECT="smoke.dot-$$"
-H6_PROJECT="smoke-h6-$$"
 STALE_PROJECT="smoke-stale-$$"
 PREFLIGHT_PROJECT="smoke-preflight-$$"
 AUTHPOISON_PROJECT="smoke-authpoison-$$"
@@ -92,21 +91,13 @@ SMOKE_LATE_SECRET="atelier-claude-token-smoke-late-$$"
 SMOKE_CLAUDE_TOKEN="smoke-enter-dummy-token-$$"
 export ATELIER_CLAUDE_SECRET="$SMOKE_CLAUDE_SECRET"
 
-PASS_COUNT=0
-FAIL_COUNT=0
-pass() { printf 'PASS: %s\n' "$1"; PASS_COUNT=$((PASS_COUNT + 1)); }
-fail() { printf 'FAIL: %s\n' "$1"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
-
-WORKDIR="$(mktemp -d)"
-PROJECT_DIR="${WORKDIR}/project-$$"
-mkdir -p "$PROJECT_DIR"
-
+# Armed only once the preconditions in section 0 have passed (see the
+# CLEANUP CONTRACT in tests/lib/smoke-common.sh): it removes agent-example
+# unconditionally, which is only safe once this suite owns that name.
 cleanup() {
-  "${TMUX_CMD[@]}" kill-server >/dev/null 2>&1 || true
-  rm -f "/tmp/tmux-$(id -u)/${TMUX_SOCKET}" 2>/dev/null || true
   local p
   for p in "$TEST_PROJECT" "$MISMATCH_PROJECT" "$NONE_PROJECT" \
-           "$DOTTED_PROJECT" "$H6_PROJECT" "$STALE_PROJECT" \
+           "$STALE_PROJECT" \
            "$PREFLIGHT_PROJECT" "$AUTHPOISON_PROJECT" "$SECRET_PROJECT" \
            "fake-checkout" "atelier-harness"; do
     "${PODMAN[@]}" rm -f "agent-${p}" >/dev/null 2>&1 || true
@@ -124,27 +115,14 @@ cleanup() {
   rm -rf "${REPO_ROOT}/containers/${STALE_PROJECT}"
   rm -rf "$WORKDIR"
 }
-trap cleanup EXIT
-
-# M6/M3: the single entry point every check below uses to run
-# agent-enter.sh. Never masks a failure: ENTER_EXIT is always the real
-# exit code, ENTER_OUT is always the real combined output, and nothing
-# here can trigger `set -e` regardless of what agent-enter.sh does.
-run_enter() {
-  ENTER_EXIT=0
-  ENTER_OUT="$("$ENTER" "$@" 2>&1)" || ENTER_EXIT=$?
-}
 
 echo "== agent-enter.sh smoke test =="
 echo "podman: ${PODMAN[*]}"
-echo "project dir: ${PROJECT_DIR}"
 echo
 
 # --- 0. Preconditions: don't run destructively over live operator state ---
 if ! "${PODMAN[@]}" image exists agent-example:latest 2>/dev/null; then
-  fail "image agent-example:latest exists locally (build it first: 'just build example')"
-  echo; echo "== summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed =="
-  exit 1
+  abort "image agent-example:latest exists locally (build it first: 'just build example')"
 fi
 pass "image agent-example:latest exists locally"
 
@@ -153,26 +131,29 @@ pass "image agent-example:latest exists locally"
 # so a down or DNS-broken proxy would otherwise surface many turns later
 # as a pile of unrelated-looking container-creation failures instead of
 # one clear line up front.
-if ! "${PODMAN[@]}" inspect "$EGRESS_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
-  fail "${EGRESS_CONTAINER} is running (it is not -- run 'just egress-up' first)"
-  echo; echo "== summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed =="
-  exit 1
+# String compare, not `| grep -q true` (SIGPIPE under pipefail).
+if [[ "$("${PODMAN[@]}" inspect "$EGRESS_CONTAINER" --format '{{.State.Running}}' 2>/dev/null)" != "true" ]]; then
+  abort "${EGRESS_CONTAINER} is running (it is not -- run 'just egress-up' first)"
 fi
 if ! "${PODMAN[@]}" exec "$EGRESS_CONTAINER" getent hosts api.github.com >/dev/null 2>&1; then
-  fail "${EGRESS_CONTAINER} resolves a public hostname (it does not -- DNS is broken inside the proxy; run 'just egress-up' to reconverge)"
-  echo; echo "== summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed =="
-  exit 1
+  abort "${EGRESS_CONTAINER} resolves a public hostname (it does not -- DNS is broken inside the proxy; run 'just egress-up' to reconverge)"
 fi
 pass "${EGRESS_CONTAINER} is running and resolves a public hostname"
 
 # M4: refuse to run at all over a live operator session named agent-example
 # -- this suite creates/removes that container, so it must not exist yet.
 if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null; then
-  fail "no pre-existing ${CONTAINER} container (found one -- refusing to run: this suite creates and removes it, which would destroy a live session)"
-  echo; echo "== summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed =="
-  exit 1
+  abort "no pre-existing ${CONTAINER} container (found one -- refusing to run: this suite creates and removes it, which would destroy a live session)"
 fi
 pass "no pre-existing ${CONTAINER} container"
+
+# Preconditions passed: from here on this suite owns every name it
+# cleans up, so the trap can be armed.
+WORKDIR="$(mktemp -d)"
+PROJECT_DIR="${WORKDIR}/project-$$"
+mkdir -p "$PROJECT_DIR"
+trap cleanup EXIT
+echo "project dir: ${PROJECT_DIR}"
 
 # Created directly with `podman secret create`, not via auth-login.sh:
 # tests/smoke.sh already covers auth-login.sh's own stdin handling, and
@@ -299,9 +280,7 @@ run_enter --project "$TEST_PROJECT" --dir "$PROJECT_DIR" --no-tmux -- true
 if [[ "$ENTER_EXIT" -eq 0 ]] && "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null; then
   pass "container ${CONTAINER} was created"
 else
-  fail "container ${CONTAINER} was created (exit=${ENTER_EXIT}: ${ENTER_OUT})"
-  echo; echo "== summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed =="
-  exit 1
+  abort "container ${CONTAINER} was created (exit=${ENTER_EXIT}: ${ENTER_OUT})"
 fi
 
 CAPDROP="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{.HostConfig.CapDrop}}')"
@@ -318,6 +297,26 @@ fi
 
 NNP="$("${PODMAN[@]}" exec "$CONTAINER" grep NoNewPrivs /proc/self/status | awk '{print $2}')"
 if [[ "$NNP" == "1" ]]; then pass "NoNewPrivs is 1"; else fail "NoNewPrivs is 1 (got: ${NNP})"; fi
+
+# Every agent-writable dir under /home/agent is its own tmpfs (over the
+# read-only root) AND writable by the agent user. Two were not, until
+# 2026-09-30: .local/state was not a tmpfs at all (gh 2.97 silently lost
+# its device-id there; mkdir failed with "Read-only file system"), and
+# .local/share was a tmpfs owned root:root 755 (touch: Permission
+# denied). findmnt -M checks the dir is itself a mountpoint -- a tmpfs
+# further up would not count.
+for d in .cache .npm .local/share .local/state .config; do
+  # shellcheck disable=SC2016 # expanded by the inner bash, on purpose
+  TMPFS_OUT="$("${PODMAN[@]}" exec "$CONTAINER" bash -c '
+    d="/home/agent/$1"
+    printf "fstype=%s " "$(findmnt -no FSTYPE -M "$d")"
+    mkdir -p "$d/smoke-probe" && touch "$d/smoke-probe/w" && echo WRITABLE' _ "$d" 2>&1)" || true
+  if [[ "$TMPFS_OUT" == "fstype=tmpfs WRITABLE" ]]; then
+    pass "/home/agent/${d} is a tmpfs writable by the agent user"
+  else
+    fail "/home/agent/${d} is a tmpfs writable by the agent user (got: ${TMPFS_OUT})"
+  fi
+done
 
 UIDMAP="$("${PODMAN[@]}" inspect "$CONTAINER" --format '{{json .HostConfig.IDMappings}}')"
 CUID="$("${PODMAN[@]}" exec "$CONTAINER" id -u)"
@@ -360,6 +359,19 @@ if [[ "$ENV_JSON" == *"HTTPS_PROXY=http://${EGRESS_CONTAINER}:3128"* && "$ENV_JS
   pass "proxied profile sets HTTPS_PROXY/https_proxy to ${EGRESS_CONTAINER}:3128"
 else
   fail "proxied profile sets HTTPS_PROXY/https_proxy to ${EGRESS_CONTAINER}:3128 (got: ${ENV_JSON})"
+fi
+
+# The Meute contract names (README.md), asserted as literals: the lib's
+# defaults with every ATELIER_* override unset. Nothing is created and the
+# real secret is never touched -- only the resolved names are printed.
+# shellcheck disable=SC2016 # expanded by the inner bash, on purpose
+CONTRACT_OUT="$(env -u ATELIER_CLAUDE_SECRET -u ATELIER_EGRESS_HOST -u ATELIER_EGRESS_NET -u ATELIER_EGRESS_PORT \
+  bash -c 'source "$1" && printf "%s|%s|%s|%s" "$EGRESS_CONTAINER" "$EGRESS_NETWORK" "$EGRESS_PORT" "$CLAUDE_SECRET"' \
+  _ "${REPO_ROOT}/scripts/lib/atelier-common.sh" 2>&1)" || true
+if [[ "$CONTRACT_OUT" == "atelier-egress|atelier-internal|3128|atelier-claude-token" ]]; then
+  pass "contract defaults: atelier-egress, atelier-internal, port 3128, secret atelier-claude-token"
+else
+  fail "contract defaults: atelier-egress, atelier-internal, port 3128, secret atelier-claude-token (got: ${CONTRACT_OUT})"
 fi
 
 # atelier-internal is created with --disable-dns (deterministic resolv.conf
@@ -595,120 +607,6 @@ else
   pass "proxied preflight failure: no container was created"
 fi
 
-# --- 12. H4: a dotted project name round-trips through the tmux layer ------
-"${TMUX_CMD[@]}" kill-server >/dev/null 2>&1 || true
-DOTTED_DIR="${WORKDIR}/dotted-project"
-mkdir -p "$DOTTED_DIR"
-DOTTED_SESSION="agent-${DOTTED_PROJECT}"
-ATELIER_TMUX="${TMUX_CMD[*]}" "$ENTER" --project "$DOTTED_PROJECT" --dir "$DOTTED_DIR" --network none </dev/null >/dev/null 2>&1 &
-DOTTED_PID=$!
-for _ in $(seq 1 20); do
-  "${TMUX_CMD[@]}" has-session -t "${DOTTED_SESSION}:" 2>/dev/null && break
-  sleep 0.5
-done
-if "${TMUX_CMD[@]}" has-session -t "${DOTTED_SESSION}:" 2>/dev/null; then
-  pass "H4: a dotted project name (${DOTTED_PROJECT}) creates a tmux session findable by has-session"
-else
-  fail "H4: a dotted project name creates a tmux session findable by has-session"
-fi
-kill "$DOTTED_PID" >/dev/null 2>&1 || true
-wait "$DOTTED_PID" 2>/dev/null || true
-
-SESSIONS_BEFORE="$("${TMUX_CMD[@]}" list-sessions -F '#{session_name}' 2>/dev/null | grep -c "^${DOTTED_SESSION}\$" || true)"
-ATELIER_TMUX="${TMUX_CMD[*]}" timeout 5 "$ENTER" --project "$DOTTED_PROJECT" --dir "$DOTTED_DIR" --network none </dev/null >/dev/null 2>&1 || true
-SESSIONS_AFTER="$("${TMUX_CMD[@]}" list-sessions -F '#{session_name}' 2>/dev/null | grep -c "^${DOTTED_SESSION}\$" || true)"
-if [[ "$SESSIONS_BEFORE" -eq 1 && "$SESSIONS_AFTER" -eq 1 ]]; then
-  pass "H4: a second invocation with a dotted project name reuses the session, not 'duplicate session'"
-else
-  fail "H4: a second invocation with a dotted project name reuses the session (before=${SESSIONS_BEFORE} after=${SESSIONS_AFTER})"
-fi
-"${PODMAN[@]}" rm -f "agent-${DOTTED_PROJECT}" >/dev/null 2>&1 || true
-
-# --- 13. tmux layer on TEST_PROJECT: session creation, reuse with pane-
-#         command verification (M3: a failed second invocation that still
-#         leaves the session count at 1 must not be reported as a pass). -
-"${TMUX_CMD[@]}" kill-server >/dev/null 2>&1 || true
-ATELIER_TMUX="${TMUX_CMD[*]}" "$ENTER" --project "$TEST_PROJECT" --dir "$PROJECT_DIR" </dev/null >/dev/null 2>&1 &
-FIRST_PID=$!
-for _ in $(seq 1 20); do
-  "${TMUX_CMD[@]}" has-session -t "${SESSION}:" 2>/dev/null && break
-  sleep 0.5
-done
-if "${TMUX_CMD[@]}" has-session -t "${SESSION}:" 2>/dev/null; then
-  pass "tmux layer creates a session named ${SESSION}"
-else
-  fail "tmux layer creates a session named ${SESSION}"
-fi
-kill "$FIRST_PID" >/dev/null 2>&1 || true
-wait "$FIRST_PID" 2>/dev/null || true
-
-# The pane's own process must still name the podman exec into this
-# container -- proves the session is genuinely attached to the right
-# thing, not just present under the right name.
-PANE_NAMES_EXEC=0
-PANE_PID="$("${TMUX_CMD[@]}" list-panes -t "${SESSION}:" -F '#{pane_pid}' 2>/dev/null)" || PANE_PID=""
-if [[ -n "$PANE_PID" ]]; then
-  PANE_ARGS="$(ps -o args= -p "$PANE_PID" 2>/dev/null)" || PANE_ARGS=""
-  [[ "$PANE_ARGS" == *exec* && "$PANE_ARGS" == *"$CONTAINER"* ]] && PANE_NAMES_EXEC=1
-fi
-if [[ "$PANE_NAMES_EXEC" -eq 1 ]]; then
-  pass "tmux session's pane command names the podman exec into ${CONTAINER}"
-else
-  fail "tmux session's pane command names the podman exec into ${CONTAINER} (pane_pid=${PANE_PID:-<none>}, args=${PANE_ARGS:-<none>})"
-fi
-
-SESSIONS_BEFORE2="$("${TMUX_CMD[@]}" list-sessions -F '#{session_name}' 2>/dev/null | grep -c "^${SESSION}\$" || true)"
-SECOND_OUT="$(ATELIER_TMUX="${TMUX_CMD[*]}" timeout 5 "$ENTER" --project "$TEST_PROJECT" --dir "$PROJECT_DIR" </dev/null 2>&1)" || SECOND_EXIT=$?
-SESSIONS_AFTER2="$("${TMUX_CMD[@]}" list-sessions -F '#{session_name}' 2>/dev/null | grep -c "^${SESSION}\$" || true)"
-# Headless, no controlling terminal: the second invocation cannot actually
-# attach. Its only acceptable outcomes are the two documented in the
-# review ("no current client" via switch-client if TMUX is set in this
-# shell, or "not a terminal" via attach if not) -- anything else (a
-# duplicate-session error, a crash) is a real failure, not an artifact of
-# the test environment.
-if [[ "$SESSIONS_BEFORE2" -eq 1 && "$SESSIONS_AFTER2" -eq 1 \
-      && "${SECOND_EXIT:-0}" -eq 1 \
-      && ( "$SECOND_OUT" == *"no current client"* || "$SECOND_OUT" == *"not a terminal"* ) ]]; then
-  pass "a second invocation attaches to the existing tmux session (headless outcome: no current client / not a terminal), not a duplicate session"
-else
-  fail "a second invocation attaches to the existing tmux session, not a duplicate session (before=${SESSIONS_BEFORE2} after=${SESSIONS_AFTER2} exit=${SECOND_EXIT:-0}: ${SECOND_OUT})"
-fi
-unset SECOND_EXIT
-
-# --- 14. H6: a container removed behind a live session is recreated before
-#         the next attach, not silently attached to a dead pane. ---------
-"${TMUX_CMD[@]}" kill-server >/dev/null 2>&1 || true
-"${PODMAN[@]}" rm -f "agent-${H6_PROJECT}" >/dev/null 2>&1 || true
-H6_DIR="${WORKDIR}/h6-project"
-mkdir -p "$H6_DIR"
-ATELIER_TMUX="${TMUX_CMD[*]}" "$ENTER" --project "$H6_PROJECT" --dir "$H6_DIR" --network none </dev/null >/dev/null 2>&1 &
-H6_PID=$!
-for _ in $(seq 1 20); do
-  "${PODMAN[@]}" container exists "agent-${H6_PROJECT}" 2>/dev/null && break
-  sleep 0.5
-done
-kill "$H6_PID" >/dev/null 2>&1 || true
-wait "$H6_PID" 2>/dev/null || true
-
-if "${PODMAN[@]}" container exists "agent-${H6_PROJECT}" 2>/dev/null; then
-  "${PODMAN[@]}" rm -f "agent-${H6_PROJECT}" >/dev/null
-  H6_CONTAINER_GONE=1
-else
-  H6_CONTAINER_GONE=0
-fi
-
-if [[ "$H6_CONTAINER_GONE" -eq 1 ]]; then
-  ATELIER_TMUX="${TMUX_CMD[*]}" timeout 5 "$ENTER" --project "$H6_PROJECT" --dir "$H6_DIR" --network none </dev/null >/dev/null 2>&1 || true
-  if "${PODMAN[@]}" container exists "agent-${H6_PROJECT}" 2>/dev/null; then
-    pass "H6: a container removed behind a live/dead session is recreated on the next tmux-path invocation"
-  else
-    fail "H6: a container removed behind a live/dead session is recreated on the next tmux-path invocation"
-  fi
-else
-  fail "H6: setup could not remove the container to test recreation"
-fi
-"${PODMAN[@]}" rm -f "agent-${H6_PROJECT}" >/dev/null 2>&1 || true
-
 # --- 15. Auth-volume mount survives a prior :Z poisoning (Meute report) ---
 # Reproduced 2026-09-23: :Z-mounting a named volume rewrites its content to
 # a PRIVATE SELinux MCS category tied to that one container; a later
@@ -793,8 +691,4 @@ else
 fi
 "${PODMAN[@]}" rm -f "agent-${SECRET_PROJECT}" >/dev/null 2>&1 || true
 
-# --- Summary ------------------------------------------------------------
-echo
-echo "== summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed =="
-[[ "$FAIL_COUNT" -gt 0 ]] && exit 1
-exit 0
+finish

@@ -301,7 +301,16 @@ whichever already exists:
   the same.
 - `--no-tmux` skips the tmux layer entirely and execs straight into the
   container -- for scripts and CI, not interactive use; a trailing command's
-  exit code propagates directly.
+  exit code propagates directly. It `exec`s (the script's PID becomes the
+  `podman exec`, so signals reach it) in every case but one: **stdin piped
+  and stdout a terminal**. There, inside the `dev` distrobox,
+  `distrobox-host-exec` would give podman a pty that swallows and echoes
+  the piped input and never delivers EOF, so the output goes through
+  `| cat` instead. On that path a command's exit code still comes back
+  (unless `cat` itself fails, e.g. the terminal goes away), but signals
+  are not forwarded: Ctrl-C reaches the whole foreground pipeline, while a
+  program stopping it must signal the process group, not the PID. Every
+  other podman call in the script gets `</dev/null` for the same reason.
 
 Project name defaults to the sanitized basename of `--dir` (default
 `$PWD`); `--project` overrides it. Validation (`scripts/valid-project-name.sh`,
@@ -312,11 +321,25 @@ used; otherwise `agent-base:latest` is used with a printed notice. Every
 `podman run` uses the AUDIT.md §4.3 flag set (`--userns=keep-id:uid=1000,gid=1000`,
 `--cap-drop=ALL`, `--security-opt=no-new-privileges`, `--init`,
 `--pids-limit=2048`, only `/work` plus the three auth volumes mounted),
-plus `--read-only` with `--tmpfs` on `/tmp`, `.cache`, `.npm`,
-`.local/share`, and `.config` -- verified against `claude`/`codex`/`pi`/`gh`
+plus `--read-only` with `--tmpfs` on `/tmp`, and `--tmpfs <dir>:U` on
+`.cache`, `.npm`, `.local/share`, `.local/state` and `.config` under
+`/home/agent` -- verified against `claude`/`codex`/`pi`/`gh`
 all working, `git status` in `/work`, and a clean (non-crashing) `claude -p`
 auth error under that flag set (see the comment block at the top of the
-script for the exact commands and results).
+script for the exact commands and results). Two 2026-09-30 fixes:
+`.local/state` is new (gh 2.97 writes `device-id` there; on the read-only
+root that write was silently lost), and `:U` (chown the tmpfs to the
+container user) is new, because Podman had created `.local/share` as a
+root-owned 755 tmpfs the agent could not write to. `/tmp` stays the stock
+root-owned 1777. Containers created before these changes keep their old
+flags until `--rebuild` (reuse is not refused over them). The podman
+routing, the base hardened flags, the egress/proxy helpers and the default
+secret name live once in `scripts/lib/atelier-common.sh`, sourced by
+`agent-enter.sh` and `auth-login.sh` (and by `auth-import.sh` for the
+podman routing only), each locating it from its own resolved path and
+refusing to run -- never falling back to the current directory -- if
+that is impossible (e.g. the script was fed to bash on stdin). It is not
+an image input, so editing it changes no tag.
 
 **`just egress-up` is a prerequisite**, not something `agent-enter.sh` runs
 for you: the default network profile is `proxied`, and creating *or*
@@ -417,7 +440,7 @@ mount of the same volume can read regardless of what mounted it last.
 
 ```sh
 just smoke
-just smoke-enter   # scripts/agent-enter.sh: needs `just build example` and `just egress-up` first
+just smoke-enter   # scripts/agent-enter.sh (3 suites): needs `just build example` and `just egress-up` first
 ```
 
 Runs `agent-base:latest` with the hardened flag set and asserts the
@@ -459,17 +482,34 @@ silently skipping the egress checks and still exiting 0 -- a clean pass
 with zero egress coverage was the exact failure mode most worth catching.
 Set `SMOKE_BASE_ONLY=1` to intentionally run only the base-image checks.
 
-`just smoke-enter` (`tests/smoke-enter.sh`) covers `agent-enter.sh`
-instead, and needs both `just build example` and a running `atelier-egress`
+`just smoke-enter` covers `agent-enter.sh` instead, as three suites run
+strictly one after another, sharing helpers in `tests/lib/smoke-common.sh`
+(a test failure, exit 1, still lets the later suites run; a refusal --
+a failed precondition, exit 2 -- stops the recipe there, so nothing else
+starts containers next to a live session):
+`tests/smoke-enter.sh` (container layer), `tests/smoke-enter-tmux.sh`
+(tmux layer) and `tests/smoke-enter-pty.sh` (stdin/pty handling). They
+need both `just build example` and a running `atelier-egress`
 (`just egress-up`) first, since the default network profile is `proxied`.
-**Refuses to run at all if a container named `agent-example` already
-exists**, rather than destroying a live operator session -- this suite
-creates and removes that container as part of testing it. The `agent-example`
+**`smoke-enter.sh` refuses to run at all if a container named
+`agent-example` already exists**, rather than destroying a live operator
+session -- this suite creates and removes that container as part of
+testing it -- and each suite arms its cleanup only after its
+preconditions pass, so a refusal removes nothing (it used to remove the
+very container it had refused over). The `agent-example`
 overlay is used for the main coverage so `jq` (the overlay tool) must
 actually be reachable; container-layer checks use `--no-tmux` (no TTY
-needed), and tmux-layer checks use a private tmux socket
-(`tmux -L atelier-test`, via `ATELIER_TMUX`) so it never touches the
-operator's real tmux server or leaves its socket file behind.
+needed), and tmux-layer checks use scratch project names and a private
+tmux socket (`tmux -L atelier-test-tmux`, via `ATELIER_TMUX`) so they
+never touch the operator's real tmux server or leave its socket file
+behind. The pty suite uses throwaway auth volumes and asserts that
+`--no-tmux` execs outside the pipe case, and -- under a real pty, only
+inside the distrobox (SKIP elsewhere) -- that a piped canary reaches the
+command exactly once and a command's exit 42 comes back, on the create
+and reuse paths and on both network profiles. The container-layer suite
+also asserts each `/home/agent` tmpfs is a tmpfs mountpoint writable by
+the agent, and the contract names as literals (`atelier-egress`,
+`atelier-internal`, port 3128, `atelier-claude-token`).
 
 It asserts the exact `podman inspect` flag set (`CapDrop`,
 `NoNewPrivileges`, the `keep-id` uid mapping, `PidsLimit`, `--init`), that
