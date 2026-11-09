@@ -1,0 +1,54 @@
+name: CI
+
+# Static checks only. The smoke suites (tests/smoke.sh -- 27 assertions,
+# tests/smoke-enter*.sh -- 45 assertions across three files) are NOT run here:
+# every one of them needs rootless podman, a built agent-base/agent-example
+# image and the atelier-egress proxy on a pinned 10.89.14.0/24 network
+# (`just build-base`, `just build example`, `just egress-up`), and they exit
+# non-zero immediately without them. Run them locally with `just smoke` and
+# `just smoke-enter`.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: shellcheck + syntax
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: bash -n
+        run: |
+          set -euo pipefail
+          for f in scripts/*.sh scripts/lib/*.sh tests/*.sh tests/lib/*.sh containers/*/entrypoint.sh; do
+            bash -n "$f"
+          done
+
+      # shellcheck is preinstalled on ubuntu-24.04 runners.
+      # SC2054: the commas in podman flag arrays (keep-id:uid=1000,gid=1000)
+      # are literal. SC2088: "~" appears in quoted human-readable messages.
+      - name: shellcheck (warning and above)
+        run: |
+          shellcheck --version
+          shellcheck -x -S warning -e SC2054,SC2088 \
+            scripts/*.sh scripts/lib/*.sh tests/*.sh tests/lib/*.sh containers/*/entrypoint.sh
+
+      - name: JSON files parse
+        run: |
+          set -euo pipefail
+          for f in renovate.json containers/agent-base/npm/package.json containers/agent-base/npm/package-lock.json; do
+            python3 -m json.tool "$f" >/dev/null
+          done
