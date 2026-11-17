@@ -23,11 +23,26 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <dir> [extra-file...]" >&2
+  echo "usage: $0 <dir> [extra-file...] | $0 --overlay <project>" >&2
   exit 2
 }
 
 [[ $# -ge 1 ]] || usage
+
+# --overlay <project>: the one definition of an overlay image's input set --
+# containers/<project> plus every file under containers/agent-base (a base
+# change must mark every overlay built on it stale). The Justfile `build`
+# recipe and agent-enter.sh's staleness check both call this instead of
+# enumerating agent-base's files themselves. Run from the repo root.
+if [[ "$1" == "--overlay" ]]; then
+  [[ $# -eq 2 ]] || usage
+  project="$2"
+  set -- "containers/${project}"
+  while IFS= read -r -d '' f; do
+    set -- "$@" "$f"
+  done < <(find containers/agent-base -type f -print0)
+fi
+
 dir="$1"
 shift
 
