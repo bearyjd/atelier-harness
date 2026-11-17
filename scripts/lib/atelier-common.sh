@@ -84,6 +84,29 @@ hardened_flags() {
   )
 }
 
+# Hardening-flag drift (finding atelier-harness-container-hardening-flag-drift).
+# A reused container keeps whatever flags it was created with, so one made
+# before a hardening change would silently stay weaker. At create time the
+# flags' sha256 is stored as a label; reuse compares it with the current
+# set. A missing label (pre-fingerprint container) counts as drift.
+HARDENING_LABEL="org.atelier.hardening-sha"
+
+hardening_fingerprint() {
+  hardened_flags
+  printf '%s\n' "${HARDENED_FLAGS[@]}" | sha256sum | awk '{print $1}'
+}
+
+# Returns 1 (message on stderr) when container $1 lacks the current fingerprint.
+check_hardening_drift() {
+  local container="$1" expected actual
+  expected="$(hardening_fingerprint)"
+  actual="$("${PODMAN[@]}" inspect "$container" --format "{{index .Config.Labels \"${HARDENING_LABEL}\"}}" </dev/null)" || actual=""
+  if [[ "$actual" != "$expected" ]]; then
+    echo "agent-enter: container ${container} was created with different (or unrecorded) hardening flags (label ${actual:-<missing>}, current ${expected:0:12}...); pass --rebuild to recreate it" >&2
+    return 1
+  fi
+}
+
 # --- Egress proxy (AUDIT.md §4.2) -----------------------------------------
 # String compare, not `| grep -q true`: grep -q exits at the first match,
 # and under pipefail the writer's SIGPIPE can fail the pipeline.
