@@ -118,9 +118,6 @@ fi
 # shellcheck source=scripts/lib/atelier-common.sh
 source "$ATELIER_LIB"
 DEFAULT_NETWORK="proxied"
-AUTH_VOLUME_CLAUDE="${ATELIER_AUTH_VOLUME_CLAUDE:-atelier-auth-claude}"
-AUTH_VOLUME_CODEX="${ATELIER_AUTH_VOLUME_CODEX:-atelier-auth-codex}"
-AUTH_VOLUME_GH="${ATELIER_AUTH_VOLUME_GH:-atelier-auth-gh}"
 CLAUDE_TOKEN_ENV="CLAUDE_CODE_OAUTH_TOKEN"
 
 # H5: fail loudly, naming the resolved root, rather than crash later with a
@@ -471,9 +468,9 @@ build_run_flags() {
     --tmpfs /home/agent/.npm:U
     --tmpfs /home/agent/.local/share:U
     --tmpfs /home/agent/.config:U
-    -v "${AUTH_VOLUME_CLAUDE}:/home/agent/.claude:z"
-    -v "${AUTH_VOLUME_CODEX}:/home/agent/.codex:z"
-    -v "${AUTH_VOLUME_GH}:/home/agent/.config/gh:z"
+    -v "${AUTH_VOLUME_CLAUDE}:${AUTH_MOUNT_CLAUDE}:${AUTH_VOLUME_OPTS}"
+    -v "${AUTH_VOLUME_CODEX}:${AUTH_MOUNT_CODEX}:${AUTH_VOLUME_OPTS}"
+    -v "${AUTH_VOLUME_GH}:${AUTH_MOUNT_GH}:${AUTH_VOLUME_OPTS}"
   )
   if [[ "$NETWORK" == "proxied" ]]; then
     add_proxy_flags
