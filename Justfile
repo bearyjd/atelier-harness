@@ -171,8 +171,9 @@ build project:
     # whatever agent-base's own file set happens to be -- it changed once
     # already (the vendored installer was replaced by a direct binary
     # download), and a hardcoded pair would have silently gone stale.
-    mapfile -d '' -t base_files < <(find containers/agent-base -type f -print0)
-    SOURCE_SHA="$(./scripts/source-sha.sh "${overlay_dir}" "${base_files[@]}")"
+    # `--overlay` is the single definition of that input set, shared with
+    # agent-enter.sh's staleness check.
+    SOURCE_SHA="$(./scripts/source-sha.sh --overlay "${project}")"
     DATE_TAG="$(date +%Y%m%d)"
     BUILD_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     TAG_ARGS=(-t "agent-${project}:latest" -t "agent-${project}:${DATE_TAG}")

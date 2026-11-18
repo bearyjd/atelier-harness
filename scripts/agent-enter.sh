@@ -329,19 +329,14 @@ ensure_image_built() {
 # build/build-base recipes do (both `cd` there first) -- absolute paths here
 # would hash to a different, permanently-mismatching manifest even when the
 # file contents are byte-identical to what was just built. For an overlay,
-# agent-base's files are enumerated at call time (not a hardcoded
-# Containerfile+installer pair) so this stays correct whatever agent-base's
-# own file set happens to be -- mirrors the Justfile's `build` recipe
-# exactly, which is the only way the two cannot drift apart (AUDIT.md §5).
+# the input set comes from `source-sha.sh --overlay`, the single definition
+# shared with the Justfile's `build` recipe so the two cannot drift apart
+# (AUDIT.md §5).
 expected_source_sha() {
   (
     cd "$REPO_ROOT"
     if [[ -f "containers/${PROJECT}/Containerfile" ]]; then
-      local base_files=()
-      while IFS= read -r -d '' f; do
-        base_files+=("$f")
-      done < <(find containers/agent-base -type f -print0)
-      ./scripts/source-sha.sh "containers/${PROJECT}" "${base_files[@]}"
+      ./scripts/source-sha.sh --overlay "${PROJECT}"
     else
       ./scripts/source-sha.sh containers/agent-base
     fi
