@@ -11,6 +11,7 @@ FROM registry.fedoraproject.org/fedora:44@sha256:dee2b968c71a167b08a6e0027db0380
 
 ARG SOURCE_SHA=unknown
 ARG BUILD_CREATED=""
+ARG EGRESS_SUBNET
 
 RUN dnf install -y --setopt=install_weak_deps=False tinyproxy \
     && dnf clean all \
@@ -53,6 +54,11 @@ RUN sed -i 's/^hosts:.*/hosts:      files dns/' /etc/nsswitch.conf
 RUN mkdir -p /etc/tinyproxy/allowlist.d
 COPY --from=allowlists . /etc/tinyproxy/allowlist.d/
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+# Single source for the subnet is the Justfile's egress_subnet; fail the
+# build rather than ship a config with the placeholder (or an empty value).
+RUN test -n "${EGRESS_SUBNET}" \
+    && sed -i "s|@EGRESS_SUBNET@|${EGRESS_SUBNET}|" /etc/tinyproxy/tinyproxy.conf \
+    && ! grep -q '@EGRESS_SUBNET@' /etc/tinyproxy/tinyproxy.conf
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

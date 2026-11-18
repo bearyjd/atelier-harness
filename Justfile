@@ -13,9 +13,9 @@ egress_port := "3128"
 # Pinned so it never collides with any other podman network on this host:
 # checked against `podman network inspect` on every existing network on
 # 2026-09-22 (10.89.0.0/24 through 10.89.13.0/24 and 10.88.0.0/16 were all
-# taken; 10.89.14.0/24 was free). containers/egress-proxy/tinyproxy.conf's
-# `Allow` directive hardcodes this same value -- the two are not read from
-# a shared source, so a change here requires the matching change there.
+# taken; 10.89.14.0/24 was free). This is the single source: build-egress
+# passes it to the egress-proxy image build, which substitutes it into
+# tinyproxy.conf's `Allow` directive.
 egress_subnet := "10.89.14.0/24"
 # Public resolvers the egress proxy itself uses via --dns. See the comment
 # in egress-up for why the network is created with --disable-dns (so
@@ -116,13 +116,16 @@ build-egress:
         project_allowlists+=("$f")
     done
 
-    SOURCE_SHA="$(./scripts/source-sha.sh containers/egress-proxy "${project_allowlists[@]}")"
+    # The subnet is baked into tinyproxy.conf at build time, so it is part
+    # of the staleness fingerprint too.
+    SOURCE_SHA="$(printf '%s %s' "$(./scripts/source-sha.sh containers/egress-proxy "${project_allowlists[@]}")" "{{egress_subnet}}" | sha256sum | cut -d' ' -f1)"
     BUILD_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "Building atelier-egress (source-sha=${SOURCE_SHA:0:12}..., allow-list union from: 00-base ${project_allowlists[*]:-<none>})"
     {{podman}} build \
         --build-context "allowlists=${STAGE}/allowlist.d" \
         --build-arg "SOURCE_SHA=${SOURCE_SHA}" \
         --build-arg "BUILD_CREATED=${BUILD_CREATED}" \
+        --build-arg "EGRESS_SUBNET={{egress_subnet}}" \
         -t "atelier-egress:latest" \
         -f containers/egress-proxy/Containerfile \
         containers/egress-proxy
