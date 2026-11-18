@@ -6,9 +6,11 @@
 podman := if path_exists("/run/.containerenv") == "true" { "distrobox-host-exec podman" } else { "podman" }
 
 base_digest := "registry.fedoraproject.org/fedora@sha256:dee2b968c71a167b08a6e0027db0380fc2f037796aeed620556a4fcbc6a1ed7f"
-egress_network := "atelier-internal"
-egress_container := "atelier-egress"
-egress_port := "3128"
+# Same ATELIER_EGRESS_* overrides scripts/lib/atelier-common.sh honors, so the
+# recipes and agent-enter.sh always agree on the proxy name and network. The
+# listen port is not overridable here: tinyproxy.conf hard-codes `Port 3128`.
+egress_network := env_var_or_default("ATELIER_EGRESS_NET", "atelier-internal")
+egress_container := env_var_or_default("ATELIER_EGRESS_HOST", "atelier-egress")
 
 # Pinned so it never collides with any other podman network on this host:
 # checked against `podman network inspect` on every existing network on
