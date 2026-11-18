@@ -467,6 +467,7 @@ build_run_flags() {
     "${HARDENED_FLAGS[@]}"
     --volume "${DIR}:/work:Z"
     --name "$CONTAINER"
+    --label "${HARDENING_LABEL}=$(hardening_fingerprint)"
     --hostname "$CONTAINER"
     --tmpfs /home/agent/.npm:U
     --tmpfs /home/agent/.local/share:U
@@ -610,6 +611,7 @@ ensure_container() {
   if "${PODMAN[@]}" container exists "$CONTAINER" 2>/dev/null </dev/null; then
     check_network_preflight
     check_container_matches_request
+    check_hardening_drift "$CONTAINER" || exit 4
     check_container_secret
     start_if_stopped
   else
