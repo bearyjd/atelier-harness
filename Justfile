@@ -203,6 +203,10 @@ build project:
 # Build every image this repo defines.
 build-all: build-base build-egress
 
+# Podman-free static check: the credential-volume contract lives only in scripts/lib/atelier-common.sh.
+contract:
+    "{{justfile_directory()}}/tests/contract-single-source.sh"
+
 # Run the security-posture + toolchain smoke test against agent-base:latest.
 smoke:
     "{{justfile_directory()}}/tests/smoke.sh"

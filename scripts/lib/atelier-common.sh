@@ -37,6 +37,22 @@ EGRESS_CONTAINER="${ATELIER_EGRESS_HOST:-atelier-egress}"
 EGRESS_NETWORK="${ATELIER_EGRESS_NET:-atelier-internal}"
 EGRESS_PORT="${ATELIER_EGRESS_PORT:-3128}"
 
+# --- Credential-volume contract (README.md, AUDIT.md §4.1) -----------------
+# Single source for the named volumes that hold the agent's credentials:
+# their names (ATELIER_AUTH_VOLUME_* override, for the smoke suites), where
+# they mount in the container, and the SELinux mount option (:z). The uid
+# mapping they are written under is hardened_flags' --userns=keep-id.
+# GH_VOLUMES is the closed set auth-login.sh accepts: one gh identity per
+# consumer (Meute contract).
+AUTH_VOLUME_CLAUDE="${ATELIER_AUTH_VOLUME_CLAUDE:-atelier-auth-claude}"
+AUTH_VOLUME_CODEX="${ATELIER_AUTH_VOLUME_CODEX:-atelier-auth-codex}"
+AUTH_VOLUME_GH="${ATELIER_AUTH_VOLUME_GH:-atelier-auth-gh}"
+GH_VOLUMES=(atelier-auth-gh atelier-auth-gh-publish atelier-auth-gh-review)
+AUTH_MOUNT_CLAUDE="/home/agent/.claude"
+AUTH_MOUNT_CODEX="/home/agent/.codex"
+AUTH_MOUNT_GH="/home/agent/.config/gh"
+AUTH_VOLUME_OPTS="z"
+
 # --- podman routing (AUDIT.md §4.4) ---------------------------------------
 # `podman` is only a shell alias to `distrobox-host-exec podman` inside the
 # `dev` distrobox; aliases don't expand in scripts. ATELIER_PODMAN wins

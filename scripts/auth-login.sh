@@ -63,8 +63,7 @@ resolve_podman
 # code of the caller's choosing holding a live credential on a network.
 # The claude path runs no container at all, so tests need no override.
 IMAGE="agent-base:latest"
-CODEX_VOLUME="${ATELIER_AUTH_VOLUME_CODEX:-atelier-auth-codex}"
-GH_VOLUMES=(atelier-auth-gh atelier-auth-gh-publish atelier-auth-gh-review)
+CODEX_VOLUME="$AUTH_VOLUME_CODEX"
 
 usage() {
   echo "usage: $0 claude | codex | gh <volume>   (gh volume: one of ${GH_VOLUMES[*]})" >&2
@@ -183,7 +182,7 @@ login_codex() {
   fi
   "${PODMAN[@]}" run --rm "${tty_flags[@]}" \
     "${HARDENED_FLAGS[@]}" "${PROXY_FLAGS[@]}" \
-    -v "${CODEX_VOLUME}:/home/agent/.codex:z" \
+    -v "${CODEX_VOLUME}:${AUTH_MOUNT_CODEX}:${AUTH_VOLUME_OPTS}" \
     "$IMAGE" \
     codex login --device-auth
 }
@@ -214,13 +213,13 @@ login_gh() {
   # login_claude) -- without it the PAT is echoed to the terminal.
   printf '%s\n' "$SECRET_INPUT" | "${PODMAN[@]}" run --rm -i \
     "${HARDENED_FLAGS[@]}" "${PROXY_FLAGS[@]}" \
-    -v "${STAGING_VOLUME}:/home/agent/.config/gh:z" \
+    -v "${STAGING_VOLUME}:${AUTH_MOUNT_GH}:${AUTH_VOLUME_OPTS}" \
     "$IMAGE" \
     gh auth login --with-token --hostname github.com --git-protocol https --insecure-storage \
     | cat
   "${PODMAN[@]}" run --rm \
     "${HARDENED_FLAGS[@]}" "${PROXY_FLAGS[@]}" \
-    -v "${STAGING_VOLUME}:/home/agent/.config/gh:ro,z" \
+    -v "${STAGING_VOLUME}:${AUTH_MOUNT_GH}:ro,${AUTH_VOLUME_OPTS}" \
     "$IMAGE" \
     gh auth status --hostname github.com </dev/null
   swap_in_staging "$vol"
@@ -251,8 +250,8 @@ swap_in_staging() {
   "${PODMAN[@]}" volume create "$vol" >/dev/null </dev/null
   "${PODMAN[@]}" run --rm --network=none \
     "${HARDENED_FLAGS[@]}" \
-    -v "${STAGING_VOLUME}:/src:ro,z" \
-    -v "${vol}:/dest:z" \
+    -v "${STAGING_VOLUME}:/src:ro,${AUTH_VOLUME_OPTS}" \
+    -v "${vol}:/dest:${AUTH_VOLUME_OPTS}" \
     "$IMAGE" \
     cp -a /src/. /dest/ </dev/null
 }
